@@ -38,7 +38,7 @@ def _count_spans_and_coref(sa_item: Dict[str, Any]) -> Tuple[int, int]:
 def format_sentence_option(sa_item: Dict[str, Any], source: Literal["span","kp","auto"] = "auto") -> str:
     i = sa_item.get("sentence_id", 0)
     sent = (sa_item.get("sentence_text") or "").replace("\n", " ")
-    snippet = (sent[:60] + ("…" if len(sent) > 60 else ""))
+    snippet = (sent[:60] + ("..." if len(sent) > 60 else ""))
     cls = sa_item.get("classification", {})
     consensus = cls.get("consensus", "?")
     b_conf = cls.get("confidence", None)
