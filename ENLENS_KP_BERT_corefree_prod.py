@@ -77,18 +77,39 @@ def _map_phrase_to_chain(sentence_text: str, sent_abs_start: int,
     return {"chain_found": False}
 
 # ---------- main ----------
-def _classify_dual(sentence: str) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
+def _classify_dual(sentence: str,
+                   agree_threshold: float = 0.1,
+                   disagree_threshold: float = 0.2,
+                   min_confidence: float = 0.5) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
     b_lab, b_conf = classify_sentence_bert(sentence)
     si_lab, si_code, si_conf = classify_sentence_similarity(sentence, SDG_TARGETS)
-    cons = determine_dual_consensus(b_lab, b_conf, si_lab, si_conf)
+    cons = determine_dual_consensus(
+        b_lab, b_conf, si_lab, si_conf,
+        agree_thresh=agree_threshold,
+        disagree_thresh=disagree_threshold,
+        min_conf=min_confidence
+    )
     primary = {"label": int(b_lab), "confidence": float(b_conf)}
     secondary = {"label": (None if si_lab is None else int(si_lab)), "code": si_code, "confidence": float(si_conf)}
     return primary, secondary, cons
 
 def run_quick_analysis(pdf_file: str, max_sentences: int = 30, top_k_phrases: int = 5,
-                       kpe_threshold: float = 0.1) -> Dict[str, Any]:
+                       kpe_threshold: float = 0.1,
+                       # Add the missing SDG consensus parameters
+                       agree_threshold: float = 0.1,
+                       disagree_threshold: float = 0.2,
+                       min_confidence: float = 0.5,
+                       # Accept other kwargs that might be passed by the bridge
+                       **kwargs) -> Dict[str, Any]:
+    
+    # Extract max_text_length if provided
+    max_text_length = kwargs.get("max_text_length")
+    
     raw = extract_text_from_pdf_robust(pdf_file)
-    full_text = preprocess_pdf_text(raw)
+    if max_text_length is not None:
+        full_text = preprocess_pdf_text(raw, max_length=int(max_text_length))
+    else:
+        full_text = preprocess_pdf_text(raw)
 
     sid2span, sent_tree = build_sentence_index(full_text)
 
@@ -111,7 +132,13 @@ def run_quick_analysis(pdf_file: str, max_sentences: int = 30, top_k_phrases: in
     for idx, sent in enumerate(sentences):
         st, en = sid2span.get(idx, (full_text.find(sent), full_text.find(sent) + len(sent)))
 
-        pri, sec, cons = _classify_dual(sent)
+        # Pass the consensus parameters to _classify_dual
+        pri, sec, cons = _classify_dual(
+            sent,
+            agree_threshold=agree_threshold,
+            disagree_threshold=disagree_threshold,
+            min_confidence=min_confidence
+        )
 
         toks, scores, offsets = token_importance_ig(sent, int(pri["label"]))
         token_items = [

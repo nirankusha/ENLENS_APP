@@ -10,7 +10,7 @@ import numpy as np
 import re
 import PyPDF2
 import spacy
-import coreferee
+from fastcoref import FCoref
 import nltk
 import matplotlib.pyplot as plt
 from IPython.display import HTML, display
@@ -23,13 +23,14 @@ from spacy.lang.en.stop_words import STOP_WORDS
 import networkx as nx
 
 
+
+
 # =============================================================================
 # Model Initialization (Shared)
 # =============================================================================
 
 # Load spaCy + coreferee
 nlp = spacy.load("en_core_web_sm")
-nlp.add_pipe('coreferee')
 # Send everything to CUDA when available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -53,6 +54,9 @@ sim_tokenizer = AutoTokenizer.from_pretrained(SIM_CHECKPOINT)
 sim_model = SentenceTransformer(SIM_CHECKPOINT)
 sim_model.to(device).eval()
 
+FASTCOREF_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+_fastcoref = FCoref(device=FASTCOREF_DEVICE)  # loads default English model
+
 # SDG target descriptions
 SDG_GOALS = [
     "No Poverty", "Zero Hunger", "Good Health and Well-being", "Quality Education",
@@ -68,7 +72,6 @@ SDG_TARGETS = json.load(open('/content/drive/MyDrive/ENLENS/sdg_targets.json', '
 # =============================================================================
 # Data Classes
 # =============================================================================
-
 class Interval:
     __slots__ = ("start", "end", "data")
     def __init__(self, start, end, data):
@@ -117,6 +120,7 @@ class IntervalTree:
 # =============================================================================
 # PDF Extraction Functions
 # =============================================================================
+
 def safe_mention_text(m):
     if isinstance(m, str):
         return m
@@ -163,7 +167,6 @@ def extract_text_from_pdf_robust(pdf_path):
 
     except Exception as e:
         raise Exception(f"PDF extraction failed: {e}")
-
 
 def preprocess_pdf_text(text, max_length=None, return_paragraphs=False):
     """Clean and preprocess extracted PDF text"""
@@ -360,6 +363,11 @@ def determine_dual_consensus(bert_label, bert_conf, sim_label, sim_conf,
 # Coreference Analysis Functions
 # =============================================================================
 
+def normalize_mention_string(s: str) -> str:
+    s = re.sub(r'\s+', ' ', s.strip().lower())
+    s = re.sub(r'[^a-z0-9 \-_/]', '', s)
+    return s
+
 
 def expand_to_full_phrase(text, char_start, char_end):
     """Expand span to full phrase using dependency parsing"""
@@ -391,53 +399,110 @@ def expand_to_full_phrase(text, char_start, char_end):
 
     return text[start:end], (start, end)
 
+def _fc_as_char_clusters(coref_res, text):
+    """
+    Normalize FastCoref outputs to: List[List[(start_char, end_char)]]
+    Works with CorefResult from fastcoref>=2.x and older list-like outputs.
+    """
+    # Case A: we got a CorefResult
+    if hasattr(coref_res, "get_clusters"):
+        # Try to get spans directly (not strings)
+        try:
+            clusters = coref_res.get_clusters(as_strings=False)
+        except TypeError:
+            clusters = coref_res.get_clusters()  # some versions ignore the kwarg
 
-def analyze_full_text_coreferences(full_text):
-    """Analyze coreferences using coreferee API"""
+        # Validate that we have [(s,e)] ints; if not, fall back to strings → locate
+        if isinstance(clusters, (list, tuple)) and clusters:
+            m0 = clusters[0][0] if clusters[0] else None
+            if isinstance(m0, (list, tuple)) and len(m0) == 2 and all(isinstance(x, int) for x in m0):
+                return clusters
+
+        # Fallback: strings → approximate char positions (greedy left→right)
+        try:
+            str_clusters = coref_res.get_clusters(as_strings=True)
+            out = []
+            for cl in str_clusters:
+                spans = []
+                cursor = 0
+                for s in cl:
+                    i = text.find(s, cursor)
+                    if i < 0:  # fallback: first occurrence
+                        i = text.find(s)
+                    if i >= 0:
+                        spans.append((i, i + len(s)))
+                        cursor = i + len(s)
+                if spans:
+                    out.append(spans)
+            return out
+        except Exception:
+            return []
+
+    # Case B: old API returning plain lists already
+    if isinstance(coref_res, (list, tuple)):
+        return [list(map(lambda p: (int(p[0]), int(p[1])), cl or [])) for cl in coref_res]
+
+    return []
+
+def _fastcoref_in_windows(full_text: str, k_sentences=3, stride=2):
     doc = nlp(full_text)
+    sents = list(doc.sents)
 
-    if not hasattr(doc._, 'coref_chains'):
-        return {"chains": [], "error": "Coreferee not properly loaded"}
+    windows = []
+    i = 0
+    while i < len(sents):
+        win = sents[i:i+k_sentences]
+        if not win: break
+        start = win[0].start_char
+        end   = win[-1].end_char
+        windows.append((start, end, full_text[start:end]))
+        i += stride
+
+    clusters_abs = []
+    for (start, end, chunk) in windows:
+        res = _fastcoref.predict([chunk])          # list[CorefResult]
+        coref_res = res[0]
+        clust = _fc_as_char_clusters(coref_res, chunk)
+        clusters_abs.extend([[(start + s, start + e) for (s, e) in c] for c in clust])
+
+    return clusters_abs
+
+
+def analyze_full_text_coreferences(full_text: str):
+    """
+    Coreference via FastCoref, returning:
+    {"chains": [{"chain_id": int, "representative": str, "mentions": [
+        {"text": str, "start_char": int, "end_char": int}
+    ]}, ...]}
+    """
+    if not full_text or not full_text.strip():
+        return {"chains": []}
+
+    try:
+        # Whole-document mode:
+        res = _fastcoref.predict([full_text])   # list[CorefResult]
+        clusters = _fc_as_char_clusters(res[0], full_text)
+
+        # If you prefer local-only coref, comment the two lines above and use:
+        # clusters = _fastcoref_in_windows(full_text, k_sentences=3, stride=2)
+
+    except Exception as e:
+        return {"chains": [], "error": f"fastcoref failed: {e}"}
 
     chains_data = []
-    for chain_idx, chain in enumerate(doc._.coref_chains):
-        chain_mentions = []
-
-        for mention in chain:
-            try:
-                if hasattr(mention, 'token_indexes'):
-                    token_indices = mention.token_indexes
-                else:
-                    token_indices = list(mention)
-
-                mention_tokens = [doc[i]
-                                  for i in token_indices if 0 <= i < len(doc)]
-                if not mention_tokens:
-                    continue
-
-                mention_text = " ".join([t.text for t in mention_tokens])
-                start_char = mention_tokens[0].idx
-                end_char = mention_tokens[-1].idx + \
-                    len(mention_tokens[-1].text)
-
-                chain_mentions.append({
-                    "text": mention_text,
-                    "start_char": start_char,
-                    "end_char": end_char,
-                    "token_indices": token_indices
-                })
-
-            except Exception as e:
-                continue
-
-        if chain_mentions:
-            representative = max(
-                chain_mentions, key=lambda x: len(x["text"]))["text"]
-            chains_data.append({
-                "chain_id": chain_idx,
-                "representative": representative,
-                "mentions": chain_mentions
-            })
+    for cid, cluster in enumerate(clusters or []):
+        if not cluster: 
+            continue
+        mentions = [{"text": full_text[s:e], "start_char": s, "end_char": e}
+                    for (s, e) in cluster if 0 <= s < e <= len(full_text)]
+        if not mentions:
+            continue
+        representative = max(mentions, key=lambda m: len(m["text"]))["text"]
+        chains_data.append({
+            "chain_id": cid,
+            "representative": representative,
+            "mentions": mentions
+        })
 
     return {"chains": chains_data}
 

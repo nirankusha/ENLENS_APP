@@ -1,36 +1,13 @@
-
-"""
-flexiconc_overlay.py
---------------------
-Interactive inline-overlay concordance selector for FlexiConc-style SQLite exports.
-
-Key features
-- Renders sentence text with clickable buttons *only* for words that intersect top spans from
-  your classifier (result['production_output']['sentence_analyses'][i]['span_analysis']).
-- Provides AND/OR multi-term querying against a precomputed inverted index of the FlexiConc
-  sentence store (loaded from the DB paths embedded in the export's "spans_file" table).
-- Exposes a callback hook `on_selection(terms, matches)` that fires on each change, so
-  downstream modules can trigger clustering/graph building immediately.
-- Returns a small "state" object you can also poll programmatically.
-
-Works with the "production_output" produced by your SpanBERT/IG pipelines, i.e. a dict with:
-  production_output['sentence_analyses'] = [
-     {'sentence_id': int, 'sentence_text': str, 'doc_start': int, 'doc_end': int,
-      'span_analysis': [{'text': '...', 'coords': (g0, g1), 'importance': float, ...}, ...]
-     },
-     ...
-  ]
-"""
-
-from __future__ import annotations
-import sqlite3, re, os
+# -*- coding: utf-8 -*-
+# === Inline span buttons + combined AND/OR concordance over FlexiConc (SQL index) + SciCo graph (non-blocking) ===
+import sqlite3, re, os, threading
 from pathlib import Path
 from collections import defaultdict
-from typing import Callable, Dict, List, Tuple, Optional, Any
 import ipywidgets as W
 from IPython.display import display, HTML
 
-__all__ = ["launch_inline_overlay_widget", "ConcordanceSelectionState"]
+# SciCo + clustering + communities + summaries
+from scico_graph_pipeline import build_graph_from_selection, ScicoConfig
 
 # ---------- schema helpers ----------
 def _first_present(d, *cands):
@@ -125,102 +102,225 @@ def load_sentences_and_index(db_path: str, limit=20000):
 # ---------- render helpers ----------
 def bold_all_terms(s: str, terms):
     if not terms: return s
-    # Sort longer terms first to avoid partial masking
     terms_sorted = sorted(set(t.lower() for t in terms), key=len, reverse=True)
-    def repl(m):
-        return f"<b>{m.group(0)}</b>"
+    def repl(m): return f"<b>{m.group(0)}</b>"
     out = s
     for t in terms_sorted:
         out = re.sub(rf"(?i)\b{re.escape(t)}\b", repl, out)
     return out
 
 def make_inline_sentence_buttons(sentence_text, span_word_positions, on_toggle_factory):
-    """
-    sentence_text: the full sentence string
-    span_word_positions: list of tuples [(start_idx, end_idx, word), ...] for words that belong to spans
-    on_toggle_factory: fn(word) -> observer callback
-    """
-    # Build a char mask: for each char, is it inside a "span-word"?
-    slot = [[] for _ in range(len(sentence_text)+1)]  # collect words starting at position
+    slot = [[] for _ in range(len(sentence_text)+1)]
     for s,e,w in span_word_positions:
         s = max(0, min(s, len(sentence_text)))
         e = max(0, min(e, len(sentence_text)))
         slot[s].append((s,e,w))
 
-    # Walk through sentence and emit either plain text or toggle button widgets
-    items = []
-    i = 0
+    items, i = [], 0
     while i < len(sentence_text):
         if i < len(slot) and slot[i]:
-            # If multiple words start at same char, emit all (rare)
             for (s,e,w) in slot[i]:
                 btn = W.ToggleButton(description=w, layout=W.Layout(height="auto"))
                 btn.observe(on_toggle_factory(w), names="value")
                 items.append(btn)
                 i = max(i, e)
         else:
-            # accumulate contiguous plain segment
             j = i
             while j < len(sentence_text) and (j >= len(slot) or not slot[j]):
                 j += 1
-            plain = sentence_text[i:j]
-            items.append(W.HTML(f"<span>{plain}</span>"))
+            items.append(W.HTML(f"<span>{sentence_text[i:j]}</span>"))
             i = j
     return W.HBox(items, layout=W.Layout(flex_flow="row wrap"))
 
-# ---------- selection state ----------
-class ConcordanceSelectionState:
-    def __init__(self):
-        self.selected_terms = set()
-        self.match_ids      = set()
-        self.matched_rows   = []   # list of dicts for convenience
-
 # ---------- main widget ----------
-def launch_inline_overlay_widget(production_output: Dict[str, Any],
-                                 db_path: str,
-                                 default_sentence_id: Optional[int] = None,
-                                 index_limit: int = 20000,
-                                 on_selection: Optional[Callable[[List[str], List[Dict[str,Any]]], None]] = None):
+def launch_inline_overlay_widget(
+    production_output,
+    db_path: str,
+    default_sentence_id: int = None,
+    index_limit=20000,
+    *,
+    scico_mode: str = "auto",            # "auto" = run on each change, "manual" = click button
+    scico_params: dict | None = None,    # passed into build_graph_from_selection
+    on_graph=None                         # optional callback: on_graph(G, meta, rows, terms)
+):
     """
-    Launch the overlay UI. If `on_selection` is provided, it will be called with
-    (terms: List[str], matches: List[dict]) every time the selection changes.
+    Concordance UI + SciCo graph (background).
     """
+
+    # --- load flexiconc slice ---
     sent_records, inv = load_sentences_and_index(db_path, limit=index_limit)
 
     # choose sentence
     sid_options = [s["sentence_id"] for s in production_output["sentence_analyses"]]
-    if not sid_options:
-        raise ValueError("No sentence_analyses present in production_output")
     if default_sentence_id is None:
-        default_sentence_id = sid_options[0]
+        default_sentence_id = sid_options[0] if sid_options else 0
 
-    dd_sid = W.Dropdown(options=sid_options, value=default_sentence_id, description="sentence_id:", layout=W.Layout(width="260px"))
-    mode = W.ToggleButtons(options=["AND","OR"], value="AND", description="Query:", layout=W.Layout(width="220px"))
-    out_sentence = W.Output()
-    out_results = W.Output()
-    state = ConcordanceSelectionState()
+    # === Top controls ===
+    dd_sid   = W.Dropdown(options=sid_options, value=default_sentence_id,
+                          description="sentence_id:", layout=W.Layout(width="260px"))
+    mode     = W.ToggleButtons(options=["AND","OR"], value="AND", description="Query:", layout=W.Layout(width="220px"))
 
-    # Build span-word positions for a given production sentence (word-level ranges in the sentence)
+    # --- shortlist controls ---
+    use_short = W.Checkbox(value=False, description="Use coherence shortlist")
+    faiss_topk = W.IntSlider(value=32, min=5, max=200, step=1, description="FAISS top-k", layout=W.Layout(width="300px"))
+    nprobe     = W.IntSlider(value=8, min=1, max=64, description="nprobe", layout=W.Layout(width="300px"))
+    add_lsh    = W.Checkbox(value=True, description="Add MinHash LSH")
+    lsh_thr    = W.FloatSlider(value=0.8, min=0.1, max=0.95, step=0.01, readout_format=".2f", description="LSH threshold")
+    minhash_k  = W.IntSlider(value=5, min=2, max=10, description="MinHash k")
+    cheap_len  = W.FloatSlider(value=0.25, min=0.0, max=1.0, step=0.05, description="Min len ratio")
+    cheap_jac  = W.FloatSlider(value=0.08, min=0.0, max=1.0, step=0.01, description="Min Jaccard")
+    use_coh    = W.Checkbox(value=False, description="Use SGNLP coherence")
+    coh_thr    = W.FloatSlider(value=0.55, min=0.0, max=1.0, step=0.01, description="Coherence thr")
+
+    # --- clustering controls ---
+    clustering = W.Dropdown(options=["auto","kmeans","torque","both","none"], value="auto", description="Clustering:")
+    kmeans_k   = W.IntSlider(value=5, min=2, max=50, description="kmeans_k")
+    use_torque = W.Checkbox(value=False, description="Use Torque (auto)")
+
+    # --- community controls ---
+    community_on = W.Dropdown(options=[("All edges","all"),("Corefer only","corefer"),("Parent/Child","parent_child")],
+                              value="all", description="Comm edges:")
+    community_method = W.Dropdown(options=[("Greedy","greedy"),("Louvain","louvain"),("Leiden","leiden"),("LabelProp","labelprop"),("None","none")],
+                                  value="greedy", description="Method:")
+
+    # --- summarization controls ---
+    summarize   = W.Checkbox(value=False, description="Summarize groups")
+    summarize_on= W.Dropdown(options=[("Communities","community"),("KMeans","kmeans"),("Torque","torque")],
+                             value="community", description="Summarize on:")
+    methods     = W.SelectMultiple(options=[("Centroid rep","centroid"),("XSum (abstractive)","xsum"),("PreSumm top","presumm")],
+                                   value=("centroid",), description="Methods:", rows=3, layout=W.Layout(width="280px"))
+    num_sent    = W.IntSlider(value=1, min=1, max=5, description="XSum sents")
+    sdg_topk    = W.IntSlider(value=3, min=1, max=10, description="SDG top-k")
+    ce_model    = W.Text(value="cross-encoder/ms-marco-MiniLM-L6-v2", description="CE model:", layout=W.Layout(width="420px"))
+
+    # --- sparsify / threshold controls ---
+    prob_thr    = W.FloatSlider(value=0.55, min=0.0, max=1.0, step=0.01, description="SciCO prob≥")
+    max_deg     = W.IntSlider(value=30, min=5, max=200, description="Max degree")
+    keep_top    = W.IntSlider(value=30, min=5, max=200, description="Keep top-E")
+
+    # --- outputs ---
+    out_sent   = W.Output()
+    out_res    = W.Output()
+    out_scico  = W.Output()
+    btn_scico  = W.Button(description="Run SciCo", button_style="success", icon="play")
+    btn_scico.layout.display = "none" if scico_mode == "auto" else ""
+
+    # --- summaries explorer UI ---
+    out_summ = W.Output()
+    box_summ = W.Accordion(children=[out_summ])
+    box_summ.set_title(0, "Group summaries (XSum | PreSumm | Centroid rep | Centroid shortlist)")
+
+    def _fmt_sdg(block):
+        if not block: return ""
+        rows = []
+        for item in block:
+            g = item.get("goal")
+            s = item.get("score")
+            if g is None or s is None: 
+                continue
+            rows.append(f"<div style='font-size:12px;color:#333;'>{float(s):.4f} — <code>{g}</code></div>")
+        return "".join(rows)
+
+    def _render_group_summary(meta, rows, cid):
+        sm = (meta.get("summaries") or {}).get(cid, {})
+        if not sm:
+            return "<em>No summary for this group.</em>"
+
+        parts = []
+
+        # XSum
+        if "xsum_summary" in sm:
+            xsum = sm["xsum_summary"]
+            xsum_sdg = _fmt_sdg(sm.get("xsum_sdg"))
+            parts.append(
+                "<div><b>XSum (1-sent):</b><br>"
+                f"<div style='margin:3px 0 6px 8px'>{xsum}</div>{xsum_sdg}</div>"
+            )
+
+        # PreSumm
+        if "presumm_top_sent" in sm:
+            ps = sm["presumm_top_sent"]; sc = sm.get("presumm_top_score")
+            presumm_sdg = _fmt_sdg(sm.get("presumm_sdg"))
+            parts.append(
+                "<div><b>PreSumm top:</b><br>"
+                f"<div style='margin:3px 0 6px 8px'>{ps}"
+                + (f" <span style='color:#666'>(score: {float(sc):.4f})</span>" if isinstance(sc, (int,float)) else "")
+                + "</div>" + presumm_sdg + "</div>"
+            )
+
+        # Centroid representative
+        if "representative" in sm:
+            rep = sm["representative"]
+            rep_sdg = _fmt_sdg(sm.get("representative_sdg"))
+            parts.append(
+                "<div><b>Centroid representative:</b><br>"
+                f"<div style='margin:3px 0 6px 8px'>{rep}</div>{rep_sdg}</div>"
+            )
+
+        # Centroid shortlist (kept)
+        kept = sm.get("centroid_kept")
+        if kept:
+            thr = sm.get("centroid_threshold")
+            head = "<div><b>Centroid shortlist</b>"
+            if isinstance(thr, (int,float)): head += f" <span style='color:#666'>(sim ≥ {thr:.2f})</span>"
+            head += "</div>"
+            items = "".join(
+                f"<div style='margin:2px 0 2px 8px'>"
+                f"<span style='color:#999'>{i:02d}</span> — "
+                f"<span style='color:#555'>{float(sim):.3f}</span> — "
+                f"{sent}</div>"
+                for i, item in enumerate(kept, 1)
+                for sent, sim in [(item.get('sentence',''), item.get('sim', 0.0))]
+            )
+            parts.append(head + items)
+
+        if not parts:
+            return "<em>No summary items produced (check summary_methods).</em>"
+
+        return "<div style='line-height:1.35em'>" + "".join(parts) + "</div>"
+
+    def update_summary_panel(meta, rows):
+        """Populate the group summaries panel after each SciCo run."""
+        out_summ.clear_output()
+        summaries = meta.get("summaries") or {}
+        if not summaries:
+            with out_summ:
+                display(HTML("<div style='color:#666'>No summaries (enable summarize=True and summary_methods in scico_params).</div>"))
+            return
+
+        cids = sorted(summaries.keys(), key=lambda x: (isinstance(x, int), x))
+        dd = W.Dropdown(options=cids, description="Group:", layout=W.Layout(width="240px"))
+        area = W.Output()
+
+        def _render(_):
+            area.clear_output()
+            cid = dd.value
+            if cid is None: return
+            html = _render_group_summary(meta, rows, cid)
+            with area:
+                display(HTML(html))
+
+        dd.observe(_render, names="value")
+        _render(None)  # initial
+
+        with out_summ:
+            display(W.VBox([dd, area]))
+
+    sel = set()
+
+    # --- span positions in the chosen production sentence ---
     word_pat = re.compile(r"\w[\w-]*", flags=re.UNICODE)
     def span_word_positions_for_sentence(prod, sentence_id):
         srec = next((s for s in prod["sentence_analyses"] if s["sentence_id"] == sentence_id), None)
         if not srec:
             return [], ""
         s_text = srec.get("sentence_text","")
-        # collect intervals for spans (local sentence coords)
         intervals = []
         for sp in srec.get("span_analysis", []) or []:
-            # sp may use absolute (global) coords; convert to local
-            g0, g1 = sp.get("coords") or (sp.get("start_char"), sp.get("end_char"))
-            if g0 is None or g1 is None: 
-                continue
+            g0, g1 = sp.get("coords", (None, None))
             s0 = srec.get("doc_start")
-            if s0 is None:
-                continue
-            local0 = max(0, g0 - s0)
-            local1 = max(0, g1 - s0)
-            intervals.append((local0, local1))
-        # find words that intersect any interval
+            if s0 is not None and g0 is not None and g1 is not None:
+                intervals.append((max(0, g0 - s0), max(0, g1 - s0)))
         pos = []
         for m in word_pat.finditer(s_text):
             w0, w1 = m.span()
@@ -236,71 +336,196 @@ def launch_inline_overlay_widget(production_output: Dict[str, Any],
             return set()
         return set.intersection(*sets) if mode_ == "AND" else set.union(*sets)
 
+    # --- background SciCo runner ---
+    def run_scico_async(terms, ids):
+        if not terms or not ids:
+            out_scico.clear_output(); return
+
+        # Collect rows the graph builder expects
+        rows = []
+        for sid in ids:
+            rec = sent_records.get(sid)
+            if rec:
+                rows.append(dict(sid=sid, text=rec["text"], path=rec["path"], start=rec["start"], end=rec["end"]))
+        if not rows:
+            out_scico.clear_output(); return
+
+        # Build argument dict for pipeline (forward all knobs; defaults come from UI here)
+        params = dict(
+            selected_terms=terms,
+            sdg_targets=None,           # plug your SDG dict if you want sentence-level CE features
+            kmeans_k=int(kmeans_k.value),
+            use_torque=bool(use_torque.value),
+            scico_cfg=ScicoConfig(prob_threshold=float(prob_thr.value)),
+            embedder=None,              # pass your SentenceTransformer if you want
+            add_layout=True,
+
+            # Use pipeline's internal shortlist path when requested
+            candidate_pairs=None,
+            use_coherence_shortlist=bool(use_short.value),
+            coherence_opts=dict(
+                faiss_topk=int(faiss_topk.value),
+                nprobe=int(nprobe.value),
+                add_lsh=bool(add_lsh.value),
+                lsh_threshold=float(lsh_thr.value),
+                minhash_k=int(minhash_k.value),
+                cheap_len_ratio=float(cheap_len.value),
+                cheap_jaccard=float(cheap_jac.value),
+                use_coherence=bool(use_coh.value),
+                coherence_threshold=float(coh_thr.value),
+                max_pairs=None,
+            ),
+
+            # clustering / communities
+            clustering_method=clustering.value,
+            community_on=community_on.value,
+            community_method=community_method.value,
+            community_weight="prob",
+
+            # sparsify
+            max_degree=int(max_deg.value),
+            top_edges_per_node=int(keep_top.value),
+
+            # summaries
+            summarize=bool(summarize.value),
+            summarize_on=summarize_on.value,
+            summary_methods=list(methods.value),
+            summary_opts=dict(
+                num_sentences=int(num_sent.value),     # for XSum
+                # presumm_model=ext_model,             # <- plug if available
+                # presumm_tokenizer=presumm_tokenizer, # <- plug if available
+                # device="cuda:0",
+                sdg_targets=None,                       # supply to re-rank summaries vs SDG goals
+                sdg_top_k=int(sdg_topk.value),
+                cross_encoder_model=ce_model.value if ce_model.value.strip() else None,
+
+                # centroid thresholding (new add-on)
+                centroid_sim_threshold=0.55,
+                centroid_top_n=5,
+                centroid_store_vector=False,
+            ),
+        )
+
+        # allow caller overrides through scico_params
+        if scico_params:
+            params.update(scico_params)
+
+        def worker():
+            try:
+                G, meta = build_graph_from_selection(rows, **params)
+                out_scico.clear_output()
+                with out_scico:
+                    comm = meta.get('communities', {})
+                    num_comm = None
+                    if isinstance(comm, dict):
+                        try:
+                            num_comm = len(set(comm.values()))
+                        except Exception:
+                            num_comm = None
+                    msg = (f"<div style='color:#3a6;'>SciCo graph ready: "
+                           f"|V|={G.number_of_nodes()} |E|={G.number_of_edges()} "
+                           f"|pairs_scored|={meta.get('pairs_scored')} "
+                           f"{f'|communities|={num_comm}' if num_comm is not None else ''}"
+                           f"</div>")
+                    display(HTML(msg))
+                    # If summaries were requested, show a quick peek
+                    if params.get("summarize") and meta.get("summaries"):
+                        display(HTML("<b>Summaries (peek):</b>"))
+                        shown = 0
+                        for cid, sm in list(meta["summaries"].items()):
+                            parts = []
+                            if "representative" in sm:
+                                parts.append(f"<i>rep</i>: {sm['representative']}")
+                            if "xsum_summary" in sm:
+                                parts.append(f"<i>xsum</i>: {sm['xsum_summary']}")
+                            if "presumm_top_sent" in sm:
+                                parts.append(f"<i>presumm</i>: {sm['presumm_top_sent']} ({sm.get('presumm_top_score','')})")
+                            if parts:
+                                display(HTML(f"<div style='margin:4px 0;'><b>Group {cid}</b>: " + " | ".join(parts) + "</div>"))
+                            shown += 1
+                            if shown >= 6:
+                                display(HTML("<div style='color:#666;font-size:12px;'>…(truncated)</div>"))
+                                break
+
+                # Populate the rich summaries panel
+                update_summary_panel(meta, rows)
+
+                if callable(on_graph):
+                    on_graph(G, meta, rows, terms)
+            except Exception as e:
+                out_scico.clear_output()
+                with out_scico:
+                    display(HTML(f"<div style='color:#b00;'>SciCo error: {e}</div>"))
+
+        out_scico.clear_output()
+        with out_scico:
+            display(HTML(f"<div style='color:#777;'>Running SciCo on {len(rows)} sentences…</div>"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    # --- render concordance list + (optionally) kick SciCo ---
     def render_results():
-        out_results.clear_output()
-        terms = sorted(state.selected_terms, key=str.lower)
+        out_res.clear_output()
+        terms = sorted(sel, key=str.lower)
         ids = combined_sentence_ids(terms, mode.value)
-        state.match_ids = ids
-        state.matched_rows = []
-        html_chunks = []
-        html_chunks.append(f"<div style='margin:4px 0;color:#666;'>Matches: {len(ids)} sentence(s) | Mode: <b>{mode.value}</b> | Terms: {', '.join(terms) if terms else '—'}</div>")
+
+        html = []
+        html.append(f"<div style='margin:4px 0;color:#666;'>Matches: {len(ids)} sentence(s) | Mode: <b>{mode.value}</b> | Terms: {', '.join(terms) if terms else '—'}</div>")
         if not ids:
-            html_chunks.append("<em>Select buttons in the sentence above to query.</em>")
+            html.append("<em>Select buttons in the sentence above to query.</em>")
         else:
             shown = 0
             for sid in list(ids)[:200]:
                 rec = sent_records.get(sid)
-                if not rec: 
-                    continue
-                state.matched_rows.append(dict(sid=sid, **rec))
-                s = bold_all_terms(rec["text"], terms)
-                html_chunks.append(f"""<div style="margin:6px 0;">
+                if not rec: continue
+                s = bold_all_terms(rec['text'], terms)
+                html.append(f"""<div style="margin:6px 0;">
                     <code style="font-size:13px;">{s}</code>
                     <div style="color:#666;font-size:12px;">{os.path.basename(rec['path'])} [{rec['start']}:{rec['end']}] (sid={sid})</div>
                 </div>""")
                 shown += 1
             if len(ids) > shown:
-                html_chunks.append(f"<div style='color:#666;font-size:12px;'>…and {len(ids)-shown} more not shown.</div>")
-        with out_results:
-            display(HTML("".join(html_chunks)))
-        if on_selection:
-            try:
-                on_selection(terms, state.matched_rows)
-            except Exception as e:
-                with out_results:
-                    display(HTML(f"<div style='color:#b00;'>Selection callback error: {e}</div>"))
+                html.append(f"<div style='color:#666;font-size:12px;'>…and {len(ids)-shown} more not shown.</div>")
+        with out_res:
+            display(HTML("".join(html)))
 
+        if scico_mode == "auto":
+            run_scico_async(terms, ids)
+
+        btn_scico.disabled = not bool(terms and ids)
+
+    # --- UI building helpers ---
     def build_sentence_row(sid):
-        out_sentence.clear_output()
+        out_sent.clear_output()
         pos, s_text = span_word_positions_for_sentence(production_output, sid)
 
         def on_toggle_factory(word):
             def _obs(change):
                 if change["name"] == "value":
                     if change["new"]:
-                        state.selected_terms.add(word)
+                        sel.add(word)
                     else:
-                        state.selected_terms.discard(word)
+                        sel.discard(word)
                     render_results()
             return _obs
 
         if not s_text:
-            with out_sentence: display(HTML("<em>Sentence text unavailable.</em>")); return
+            with out_sent: display(HTML("<em>Sentence text unavailable.</em>")); return
         if not pos:
-            with out_sentence:
+            with out_sent:
                 display(HTML(f"<div style='margin-bottom:8px;'><b>Sentence:</b> {s_text}</div><em>No span words available for selection.</em>"))
                 return
 
-        # Build inline overlay
         inline = make_inline_sentence_buttons(s_text, pos, on_toggle_factory)
-        with out_sentence:
+        with out_sent:
             display(HTML("<div style='margin-bottom:6px;color:#444;'>Click one or more <b>highlighted words</b> to build a combined query.</div>"))
             display(inline)
 
     def on_sid_change(change):
         if change["name"] == "value":
-            state.selected_terms.clear()
-            out_results.clear_output()
+            sel.clear()
+            out_res.clear_output()
+            out_scico.clear_output()
+            out_summ.clear_output()
             build_sentence_row(change["new"])
             render_results()
 
@@ -308,20 +533,69 @@ def launch_inline_overlay_widget(production_output: Dict[str, Any],
         if change["name"] == "value":
             render_results()
 
+    def on_scico_click(_):
+        terms = sorted(sel, key=str.lower)
+        ids = combined_sentence_ids(terms, mode.value)
+        run_scico_async(terms, ids)
+
     dd_sid.observe(on_sid_change, names="value")
     mode.observe(on_mode_change, names="value")
+    btn_scico.on_click(on_scico_click)
 
     # initial render
     build_sentence_row(default_sentence_id)
     render_results()
 
+    # --- layout ---
+    shortlist_box = W.Accordion(children=[W.VBox([
+        use_short, W.HBox([faiss_topk, nprobe]),
+        W.HBox([add_lsh, lsh_thr, minhash_k]),
+        W.HBox([cheap_len, cheap_jac]),
+        W.HBox([use_coh, coh_thr]),
+    ])])
+    shortlist_box.set_title(0, "Candidate shortlist (FAISS / LSH / Coherence)")
+
+    cluster_box = W.Accordion(children=[W.VBox([
+        W.HBox([clustering, kmeans_k, use_torque])
+    ])])
+    cluster_box.set_title(0, "Embedding clustering")
+
+    community_box = W.Accordion(children=[W.VBox([
+        W.HBox([community_on, community_method])
+    ])])
+    community_box.set_title(0, "Community detection")
+
+    summary_box = W.Accordion(children=[W.VBox([
+        W.HBox([summarize, summarize_on]),
+        W.HBox([methods, W.VBox([num_sent, sdg_topk, ce_model])]),
+    ])])
+    summary_box.set_title(0, "Summaries (centroid / XSum / PreSumm + SDG re-rank)")
+
+    sparsify_box = W.Accordion(children=[W.VBox([
+        W.HBox([prob_thr]),
+        W.HBox([max_deg, keep_top]),
+    ])])
+    sparsify_box.set_title(0, "Edge threshold & sparsify")
+
+    header = [dd_sid, mode]
+    if scico_mode == "manual":
+        header.append(btn_scico)
+
     ui = W.VBox([
-        W.HBox([dd_sid, mode]),
+        W.HBox(header),
         W.HTML("<hr style='margin:6px 0;'>"),
-        out_sentence,
+        out_sent,
         W.HTML("<hr style='margin:6px 0;'>"),
         W.HTML("<b>Concordances (combined query)</b>"),
-        out_results
+        out_res,
+        W.HTML("<hr style='margin:6px 0;'>"),
+        shortlist_box,
+        cluster_box,
+        community_box,
+        summary_box,
+        sparsify_box,
+        W.HTML("<hr style='margin:6px 0;'>"),
+        out_scico,   # status line
+        box_summ,    # group summaries explorer
     ])
     display(ui)
-    return ui, state

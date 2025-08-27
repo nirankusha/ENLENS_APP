@@ -194,6 +194,36 @@ def upsert_sentence_embeddings(conn: sqlite3.Connection, doc_id: str,
         """, rows)
         conn.commit()
 
+def get_sentence_embedding_cached(conn, doc_id, sentence_id, text, model_name="paraphrase-mpnet-base-v2"):
+    """
+    Returns np.ndarray[float32, dim] embedding for a sentence.
+    Persists into 'embeddings' table to amortize cost.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT vector, dim FROM embeddings WHERE doc_id=? AND sentence_id=? AND model=?",
+                    (str(doc_id), int(sentence_id), model_name))
+        row = cur.fetchone()
+        if row:
+            vec = np.frombuffer(row[0], dtype="float32")
+            return vec
+    except Exception:
+        pass
+
+    # Fallback: compute via helper.sim_model
+    from helper import sim_model
+    emb = sim_model.encode([text])[0].astype("float32")
+    try:
+        cur.execute(
+            "INSERT OR REPLACE INTO embeddings(doc_id, sentence_id, model, dim, vector) VALUES (?,?,?,?,?)",
+            (str(doc_id), int(sentence_id), model_name, int(emb.shape[0]), emb.tobytes())
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    return emb
+
+
 def export_production_to_flexiconc(db_path: str, doc_id: str, production_output: Dict[str, Any],
                                    uri: Optional[str] = None, write_embeddings: bool = False):
     conn = open_db(db_path)
