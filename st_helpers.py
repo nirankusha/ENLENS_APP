@@ -308,6 +308,195 @@ def render_concordance_panel(conc_results):
             f"{(r.get('text','') or '')[:160]}"
         )
 
+def _normalize_spacing(tokens: list[str]) -> str:
+    """
+    Join tokens into a readable phrase:
+   - no space before , . ; : ? ! )
+    - no space after ( or opening quotes
+    """
+    no_space_before = {",", ".", ";", ":", "?", "!", ")", "’", '"', "”"}
+    no_space_after  = {"(", "‘", '"', "“"}
+    out: list[str] = []
+    for i, t in enumerate(tokens):
+        if i == 0:
+            out.append(t)
+            continue
+        prev = out[-1]
+        if t in no_space_before:
+            out[-1] = prev + t
+        elif prev in no_space_after:
+            out[-1] = prev + t
+        else:
+            out.append(" " + t)
+    return "".join(out)
+
+def _ensure_query_builder():
+    ss = st.session_state
+    ss.setdefault("query_builder", {
+        "active_tokens": [],     # tokens clicked but not committed
+        "current_phrase": "",    # live preview of the phrase under construction
+        "phrases": [],           # committed phrases (list[str])
+        "ops": [],               # future: operators between phrases (AND/OR/NEAR/…)
+        "constraints": {},       # future: flexiconc constraints
+    })
+    # Back-compat shim: keep query_terms in sync with committed phrases
+    ss.setdefault("query_terms", ss["query_builder"]["phrases"])
+    return ss["query_builder"]
+
+def handle_clicked_term(term: str):
+    qb = _ensure_query_builder()
+    # Treat multi-word chunks as single units for now
+    qb["active_tokens"].append(term)
+    qb["current_phrase"] = _normalize_spacing(qb["active_tokens"])
+
+def commit_current_phrase():
+    qb = _ensure_query_builder()
+    phrase = qb["current_phrase"].strip()
+    if phrase and phrase not in qb["phrases"]:
+        qb["phrases"].append(phrase)
+        st.session_state["query_terms"] = qb["phrases"]  # sync alias
+    qb["active_tokens"].clear()
+    qb["current_phrase"] = ""
+
+def undo_last_token():
+    qb = _ensure_query_builder()
+    if qb["active_tokens"]:
+        qb["active_tokens"].pop()
+        qb["current_phrase"] = _normalize_spacing(qb["active_tokens"])
+        
+def clear_phrase_builder():
+    qb = _ensure_query_builder()
+    qb["active_tokens"].clear()
+    qb["current_phrase"] = ""
+
+def remove_phrase(i: int):
+    qb = _ensure_query_builder()
+    if 0 <= i < len(qb["phrases"]):
+        qb["phrases"].pop(i)
+        st.session_state["query_terms"] = qb["phrases"]
+
+def compile_flexiconc_query(
+    phrases: list[str],
+    ops: list[str] | None = None,
+    constraints: dict | None = None,
+) -> str:
+    """
+    Hook for future compound FlexiConc queries.
+    For now: produce a simple quoted-conjunction string: "ph1" "ph2" ...
+    """
+    if not phrases:
+        return ""
+    return " ".join(f"\"{p}\"" for p in phrases)
+
+# ==================== Top-K chip bar ====================
+
+def render_topk_chip_bar(
+    sent_obj: Dict[str, Any],
+    *,
+    topk_tokens: int = 8,
+    topk_spans: int = 6,
+    min_abs_importance: float = 0.10,
+    pos_threshold: float = 0.15,
+    neg_threshold: float = 0.20,
+    candidate_source: str = "span",  # "span" | "kp" | "auto"
+) -> Optional[str]:
+    """
+    Compact chip bar:
+      • top-K tokens by |importance|
+      • top-M spans by |importance|
+    Returns clicked term (str) or None.
+    """
+    clicked: Optional[str] = None
+
+    # tokens
+    toks = _extract_tokens(sent_obj)  # List[(text, score)]
+    toks = [(t, s) for (t, s) in toks if s is None or abs(float(s)) >= float(min_abs_importance)]
+    toks_sorted = sorted(toks, key=lambda x: (0.0 if x[1] is None else abs(float(x[1]))), reverse=True)[:topk_tokens]
+
+    # spans (from span_analysis OR KPE depending on candidate_source)
+    spans = _extract_spans(sent_obj)  # List[(text, score)]
+    spans = [(t, s) for (t, s) in spans if s is None or abs(float(s)) >= float(min_abs_importance)]
+    spans_sorted = sorted(spans, key=lambda x: (0.0 if x[1] is None else abs(float(x[1]))), reverse=True)[:topk_spans]
+    # Header
+    st.caption("🎯 Top-K candidates (click to add to phrase)")
+
+    # Render token chips
+    if toks_sorted:
+        st.write("**Tokens**")
+        cols = st.columns(min(6, max(2, len(toks_sorted))))
+        for i, (term, score) in enumerate(toks_sorted):
+            with cols[i % len(cols)]:
+                color = _score_to_rgba(score, pos_threshold, neg_threshold)
+                tooltip = f"score={score:.4f}" if isinstance(score, (int, float)) else "no score"
+                st.markdown(
+                    f"""
+                    <div title="{html.escape(tooltip)}" style="margin-bottom:4px;">
+                      <div style="width:100%;height:4px;background:{color};border-radius:4px;"></div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                if st.button(term, key=f"tok_chip_{i}"):
+                    clicked = term
+
+    # Render span chips
+    if spans_sorted:
+        st.write("**Spans/Keyphrases**")
+        cols = st.columns(min(6, max(2, len(spans_sorted))))
+        for i, (term, score) in enumerate(spans_sorted):
+            with cols[i % len(cols)]:
+                color = _score_to_rgba(score, pos_threshold, neg_threshold)
+                tooltip = f"score={score:.4f}" if isinstance(score, (int, float)) else "no score"
+                st.markdown(
+                    f"""
+                    <div title="{html.escape(tooltip)}" style="margin-bottom:4px;">
+                      <div style="width:100%;height:4px;background:{color};border-radius:4px;"></div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                if st.button(term, key=f"span_chip_{i}"):
+                    clicked = term
+
+    return clicked
+
+def render_clickable_token_strip(
+    sent_obj: Dict[str, Any],
+    *,
+    max_per_row: int = 10,
+    pos_threshold: float = 0.15,
+    neg_threshold: float = 0.20,
+) -> Optional[str]:
+    """
+    Render *all* tokens as small buttons in wrapped rows (readable, clickable).
+    Returns clicked token or None.
+    """
+    toks = _extract_tokens(sent_obj)  # List[(text, score)]
+    if not toks:
+        return None
+    clicked = None
+    st.caption("🖱️ Clickable tokens")
+    # chunk into rows
+    row = []
+    for idx, (term, score) in enumerate(toks):
+        row.append((term, score, idx))
+        if len(row) == max_per_row or idx == len(toks) - 1:
+            cols = st.columns(len(row))
+            for i, (term_i, score_i, abs_i) in enumerate(row):
+                with cols[i]:
+                    color = _score_to_rgba(score_i, pos_threshold, neg_threshold)
+                    tooltip = f"score={score_i:.4f}" if isinstance(score_i, (int,float)) else "no score"
+                    st.markdown(
+                        f'<div title="{html.escape(tooltip)}" '
+                        f'style="margin-bottom:4px;"><div '
+                        f'style="width:100%;height:3px;background:{color};border-radius:4px;"></div></div>',
+                        unsafe_allow_html=True
+                    )
+                    if st.button(term_i, key=f"tokbtn_{abs_i}"):
+                        clicked = term_i
+            row = []
+    return clicked
+
 def render_clusters_panel(G, meta, sentence_idx: int, summarize_opts: Dict[str, bool]):
     """List-only summary of communities/clusters for a sentence."""
     summaries = meta.get("summaries") or {}

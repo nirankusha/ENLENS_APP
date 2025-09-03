@@ -38,7 +38,11 @@ EXPLAIN_CONFIG = {
     "kpe_checkpoint_path": "/content/BERT-KPE/checkpoints/bert2span.bin",
 
     "color_scale": "tomato_alpha",
+    "min_abs_importance": 0.10,
+    "topk_tokens_chips": 8,
+    "topk_spans_chips": 6,
 }
+
 
 COREF_CONFIG = {
     "engine": "fastcoref",

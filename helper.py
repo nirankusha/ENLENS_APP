@@ -132,42 +132,50 @@ def safe_mention_text(m):
 
 
 def extract_text_from_pdf_robust(pdf_path):
-    """Robust PDF text extraction with error handling"""
-    print(f"📄 Extracting text from PDF: {pdf_path}")
+    """Robust text extraction: handles PDFs and plain .txt files."""
+    from pathlib import Path
+    import mimetypes
+    import PyPDF2
 
-    if not Path(pdf_path).exists():
-        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+    p = Path(pdf_path)
+    print(f"📄 Extracting text from: {p}")
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {p}")
 
+    # 1) Accept plain text directly
+    mtype, _ = mimetypes.guess_type(str(p))
+    if str(p).lower().endswith(".txt") or (mtype and mtype.startswith("text/")):
+        return p.read_text(encoding="utf-8", errors="ignore")
+
+    # 2) Parse PDF
+    text = ""
+    pages_extracted = 0
     try:
-        with open(pdf_path, 'rb') as file:
-            pdf_reader = PyPDF2.PdfReader(file)
+        with p.open("rb") as fh:
+            reader = PyPDF2.PdfReader(fh)
 
-            if pdf_reader.is_encrypted:
-                print("🔒 PDF is encrypted, attempting to decrypt...")
-                pdf_reader.decrypt('')
-
-            text = ""
-            pages_extracted = 0
-
-            for page_num, page in enumerate(pdf_reader.pages):
+            # Try decrypt if needed (empty password)
+            if getattr(reader, "is_encrypted", False):
+                print("🔒 Encrypted PDF: attempting blank-password decrypt")
                 try:
-                    page_text = page.extract_text()
-                    if page_text and page_text.strip():
-                        text += page_text + "\n\n"
+                    reader.decrypt("")
+                except Exception:
+                    pass  # continue; some readers still allow reading
+
+            for page_num, page in enumerate(reader.pages, start=1):
+                try:
+                    t = page.extract_text() or ""
+                    if t.strip():
+                        text += t + "\n\n"
                         pages_extracted += 1
-                        print(
-                            f"  ✅ Page {page_num + 1}: {len(page_text)} characters")
                 except Exception as e:
-                    print(f"  ⚠️  Page {page_num + 1}: {e}")
-                    continue
+                    print(f"  ⚠️ Page {page_num}: {e}")
 
-            print(
-                f"✅ Extracted {pages_extracted}/{len(pdf_reader.pages)} pages, {len(text)} characters")
-            return text.strip()
-
+        print(f"✅ Extracted {pages_extracted}/{len(reader.pages)} pages, {len(text)} chars")
+        return text.strip()
     except Exception as e:
         raise Exception(f"PDF extraction failed: {e}")
-
+        
 def preprocess_pdf_text(text, max_length=None, return_paragraphs=False):
     """Clean and preprocess extracted PDF text"""
     print("🧹 Preprocessing PDF text…")

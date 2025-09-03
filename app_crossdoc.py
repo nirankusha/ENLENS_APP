@@ -3,10 +3,12 @@
 # Streamlit UI: document/corpus analysis with clickable spans/words,
 # coref lists, concordance, and SciCo clustering/communities (no graph viz)
 
+import re
 import os
 from pathlib import Path
 import importlib
 import streamlit as st
+from typing import Dict, List, Any
 
 # Local helpers / configs
 from ui_config import (
@@ -16,8 +18,13 @@ from ui_config import (
 from st_helpers import (
     make_sentence_selector, render_sentence_text_with_chips,
     render_coref_panel, render_clusters_panel, render_concordance_panel,
-    toast_info, reset_terms_on_sentence_change
+    toast_info, reset_terms_on_sentence_change,
+    render_topk_chip_bar, handle_clicked_term, render_clickable_token_strip,
+    commit_current_phrase, undo_last_token, clear_phrase_builder,
+    remove_phrase, _ensure_query_builder
 )
+from ui_common import render_sentence_overlay
+
 from bridge_runners import (
     run_ingestion_quick, rows_from_production, build_scico,
     build_concordance, pick_sentence_coref_groups
@@ -47,6 +54,8 @@ def _init_state():
     ss.setdefault("selected_sentence_idx", 0)
     ss.setdefault("query_terms", [])
     ss.setdefault("last_action_ts", 0.0)
+    ss.setdefault("current_doc_rows", None)  # cache for single-doc concordance
+    ss.setdefault("source_root", "")         # NEW: for legacy relative paths
 
 _init_state()
 
@@ -64,6 +73,85 @@ def _get_production_output(obj):
     if isinstance(obj, dict) and "production_output" in obj:
         return obj["production_output"]
     return None
+
+# ---------- Single-doc concordance (no DB) ----------
+def _rows_from_production_local(production_output: Dict[str, Any], uri: str) -> List[Dict[str, Any]]:
+    """Flatten the current analysis to rows consumable by concordance; adds path for display."""
+    rows: List[Dict[str, Any]] = []
+    if not production_output:
+        return rows
+    for s in production_output.get("sentence_analyses", []):
+        rows.append({
+            "path": uri,
+            "start": s.get("doc_start"),
+            "end": s.get("doc_end"),
+            "text": s.get("sentence_text") or "",
+            "sentence_id": s.get("sentence_id"),
+        })
+    return rows
+
+def _filter_rows_by_terms(rows: List[Dict[str, Any]], terms: List[str], mode: str="AND") -> List[Dict[str, Any]]:
+    """In-memory AND/OR substring match over 'text' (case-insensitive)."""
+    if not rows or not terms:
+        return []
+    tnorm = [t.strip().lower() for t in terms if t and t.strip()]
+    if not tnorm:
+        return []
+    out = []
+    for r in rows:
+        txt = (r.get("text") or "").lower()
+        hits = [(t in txt) for t in tnorm]
+        ok = all(hits) if mode == "AND" else any(hits)
+        if ok:
+            out.append(r)
+    return out
+
+def _bold_terms_html(s: str, terms: List[str]) -> str:
+    """Bold term occurrences (case-insensitive, word-ish boundary)."""
+    if not s or not terms:
+        return s or ""
+    out = s
+    for t in sorted(set(t for t in terms if t), key=len, reverse=True):
+        pat = re.compile(rf"(?i)\b{re.escape(t)}\b")
+        out = pat.sub(lambda m: f"<b>{m.group(0)}</b>", out)
+    return out
+
+def _render_single_doc_concordance():
+    prod = _get_production_output(st.session_state.get("results"))
+    uri = (st.session_state.get("results") or {}).get("document_uri", "")
+    rows = st.session_state.get("current_doc_rows") or _rows_from_production_local(prod, uri)
+
+    st.markdown("---")
+    st.subheader("Single-doc Concordance (fresh analysis)")
+    if not rows:
+        st.caption("Run **Analyze selected (fresh)** (Corpus) or **Run PDF analysis** (Document) first.")
+        return
+
+    qcol1, qcol2 = st.columns([3, 1])
+    with qcol1:
+        terms = st.session_state.get("query_terms", [])
+        st.write("Selected terms:", ", ".join(terms) if terms else "—")
+    with qcol2:
+        mode = st.radio("Mode", ["AND", "OR"], horizontal=True, key="single_doc_cc_mode")
+
+    matches = _filter_rows_by_terms(rows, terms, mode=mode)
+    st.caption(f"Matches: {len(matches)} sentence(s)")
+    if not matches:
+        st.info("Click chips or tokens above to add terms.")
+        return
+
+    for r in matches[:300]:
+        s = _bold_terms_html(r["text"], terms)
+        st.markdown(
+            f"<div style='margin:6px 0;'>"
+            f"<code style='font-size:13px'>{s}</code>"
+            f"<div style='color:#666;font-size:12px'>{r['path']} "
+            f"[{r.get('start')}:{r.get('end')}] (sid={r.get('sentence_id')})</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    if len(matches) > 300:
+        st.caption(f"…and {len(matches)-300} more not shown.")
 
 # -------------------- Sidebar --------------------
 with st.sidebar:
@@ -106,6 +194,11 @@ with st.sidebar:
     else:
         dbp = st.text_input("FlexiConc SQLite path", value=st.session_state["db_path"])
         st.session_state["db_path"] = dbp
+        # NEW: legacy/relative path support
+        st.session_state["source_root"] = st.text_input(
+            "Source folder (optional, e.g. /content/en)",
+            value=st.session_state.get("source_root", "")
+        )
 
     # Knobs — Ingestion
     with st.expander("Files / Corpus upload", expanded=False):
@@ -136,7 +229,9 @@ with st.sidebar:
         cfg["kpe_threshold"] = st.slider("kpe_threshold", 0.0, 1.0, cfg["kpe_threshold"], 0.01)
         cfg["positive_thr"] = st.slider("positive_thr (pill blue)", 0.0, 1.0, cfg.get("positive_thr", 0.15), 0.01)
         cfg["negative_thr"] = st.slider("negative_thr (pill red)", 0.0, 1.0, cfg.get("negative_thr", 0.20), 0.01)
-
+        cfg["min_abs_importance"] = st.slider("min_abs_importance (filter noise)", 0.0, 1.0, cfg.get("min_abs_importance", 0.10), 0.01)
+        cfg["topk_tokens_chips"] = st.slider("topk_tokens_chips", 1, 24, cfg.get("topk_tokens_chips", 8))
+        cfg["topk_spans_chips"] = st.slider("topk_spans_chips", 1, 24, cfg.get("topk_spans_chips", 6))
     # Knobs — Coreference
     with st.expander("Coreference (fastcoref)", expanded=False):
         cfg = st.session_state["config_coref"]
@@ -257,18 +352,185 @@ with st.container(border=True):
                     st.success(f"✅ Analysis complete. {n} sentences available.")
                 else:
                     st.error(f"❌ Analysis failed or empty. {res.get('error','')}")
-            
     else:
+        # -------------------- CORPUS MODE --------------------
         db_path = st.session_state["db_path"]
+        source_root = (st.session_state.get("source_root") or "").strip()
+
+        def _resolve_path(p: str) -> str:
+            if not p:
+                return p
+            if os.path.isabs(p):
+                return p
+            # join relative to source_root if provided
+            return os.path.normpath(os.path.join(source_root or "", p))
+
+        available_docs = []
         if not Path(db_path).exists():
             st.warning("Set a valid SQLite path.")
         else:
-            st.success("Corpus DB ready.")
+            conn = None
+            try:
+                from flexiconc_adapter import open_db
+                import pandas as pd
+                conn = open_db(db_path)
 
+                # First try new schema: documents(uri, full_text)
+                df = pd.read_sql_query(
+                    """
+                    SELECT doc_id, uri, created_at, LENGTH(full_text) AS text_length
+                    FROM documents
+                    ORDER BY created_at DESC
+                    """,
+                    conn
+                )
+                if not df.empty:
+                    st.success(f"Corpus DB ready - {len(df)} documents found")
+                    st.dataframe(df, use_container_width=True)
+                    available_docs = df.to_dict("records")
+                else:
+                    # Fallback: legacy schema spans_file/files (path-only)
+                    st.info("No rows in documents table; trying legacy schema (spans_file/files)…")
+                    # probe table name
+                    tb = None
+                    for cand in ("spans_file", "files", "documents"):
+                        try:
+                            pd.read_sql_query(f"SELECT 1 FROM {cand} LIMIT 1", conn)
+                            tb = cand
+                            break
+                        except Exception:
+                            pass
+                    if not tb:
+                        st.warning("Could not find legacy file table (spans_file/files).")
+                    else:
+                        # find likely columns
+                        meta = pd.read_sql_query(f"PRAGMA table_info({tb})", conn)
+                        cols = {r["name"] for _, r in meta.iterrows()}
+                        id_col = "id" if "id" in cols else ("rowid" if "rowid" in cols else next(iter(cols)))
+                        path_col = next((c for c in ("path","filepath","filename","name") if c in cols), None)
+                        if not path_col:
+                            st.warning(f"Table {tb} has no path-like column.")
+                        else:
+                            df2 = pd.read_sql_query(
+                                f"SELECT {id_col} AS doc_id, {path_col} AS uri FROM {tb}",
+                                conn
+                            )
+                            if df2.empty:
+                                st.info("Legacy table is empty.")
+                            else:
+                                # resolve relative paths using source_root (if set)
+                                df2["uri"] = df2["uri"].apply(_resolve_path)
+                                df2["created_at"] = None
+                                df2["text_length"] = None
+                                st.success(f"Found {len(df2)} file entries in {tb}.")
+                                st.dataframe(df2, use_container_width=True)
+                                available_docs = df2.to_dict("records")
+            except Exception as e:
+                st.error(f"Error accessing corpus: {e}")
+            finally:
+                if conn is not None:
+                    conn.close()
+
+        st.session_state["available_docs"] = available_docs
+
+        # Document selection dropdown
+        selected_doc_id = st.session_state.get("selected_doc_id")
+        if available_docs:
+            doc_options = [
+                f"{d['doc_id']} - {d.get('uri','no path')} ({d.get('text_length',0)} chars)"
+                for d in available_docs
+            ]
+            selected_idx = st.selectbox(
+                "Select document to analyze:",
+                range(len(doc_options)),
+                format_func=lambda i: doc_options[i],
+                key="corpus_doc_selector",
+            )
+            if selected_idx is not None:
+                selected_doc_id = available_docs[selected_idx]["doc_id"]
+                st.session_state["selected_doc_id"] = selected_doc_id
+                st.info(f"Selected: {selected_doc_id}")
+
+        # Actions: load saved vs fresh analysis
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            load_btn = st.button("Load Document Analysis (from DB)")
+        with c2:
+            fresh_btn = st.button("Analyze selected (fresh)")
+
+        # Load saved (FlexiConc) analysis if present
+        if load_btn and selected_doc_id is not None:
+            try:
+                from flexiconc_adapter import load_production_from_flexiconc
+                with st.spinner("Loading saved analysis from DB..."):
+                    loaded_production = load_production_from_flexiconc(db_path, selected_doc_id)
+                    if loaded_production and loaded_production.get("sentence_analyses"):
+                        st.session_state["results"] = {"production_output": loaded_production}
+                        st.session_state["current_doc_rows"] = None
+                        st.success(f"Loaded analysis for {selected_doc_id} - {len(loaded_production['sentence_analyses'])} sentences")
+                    else:
+                        st.error("No analysis found for selected document")
+            except Exception as e:
+                st.error(f"Failed to load document: {e}")
+
+        # FRESH in-memory analysis on the selected row's URI (no FlexiConc I/O)
+        if fresh_btn and selected_doc_id is not None:
+            if not available_docs:
+                st.warning("No corpus rows loaded.")
+            else:
+                row = next((r for r in available_docs if r["doc_id"] == selected_doc_id), None)
+                if not row:
+                    st.warning("Could not resolve selected document row.")
+                else:
+                    uri = row.get("uri") or row.get("path") or row.get("filepath")
+                    if not uri:
+                        st.warning("Selected row has no uri/path.")
+                    else:
+                        with st.spinner(f"Analyzing file (fresh): {uri}"):
+                            try:
+                                res = run_ingestion_quick(
+                                    pdf_path=uri,
+                                    max_sentences=st.session_state["config_ingest"]["max_sentences"],
+                                    max_text_length=st.session_state["config_ingest"]["max_text_length"],
+                                    candidate_source=st.session_state["config_ui"]["candidate_source"],
+                                    ig_enabled=st.session_state["config_explain"]["ig_enabled"],
+                                    span_masking_enabled=st.session_state["config_explain"]["span_masking_enabled"],
+                                    max_span_len=st.session_state["config_explain"]["max_span_len"],
+                                    top_k_spans=st.session_state["config_explain"]["top_k_spans"],
+                                    kpe_top_k=st.session_state["config_explain"]["kpe_top_k"],
+                                    kpe_threshold=st.session_state["config_explain"]["kpe_threshold"],
+                                    coref_scope=st.session_state["config_coref"]["scope"],
+                                    coref_window_sentences=st.session_state["config_coref"].get("window_sentences"),
+                                    coref_window_stride=st.session_state["config_coref"].get("window_stride"),
+                                    agree_threshold=st.session_state["config_sdg"]["agree_threshold"],
+                                    disagree_threshold=st.session_state["config_sdg"]["disagree_threshold"],
+                                    min_confidence=st.session_state["config_sdg"]["min_confidence"],
+                                )
+                                # attach uri for display; cache rows for single-doc concordance
+                                res = dict(res or {})
+                                res["document_uri"] = uri
+                                st.session_state["results"] = res
+                                st.session_state["current_doc_rows"] = _rows_from_production_local(
+                                    _get_production_output(res), uri
+                                )
+                                prod = _get_production_output(res)
+                                n = len((prod or {}).get("sentence_analyses", []))
+                                if res.get("ok") and n:
+                                    st.success(f"✅ Fresh analysis complete. {n} sentences available.")
+                                else:
+                                    st.error(f"❌ Analysis failed or empty. {res.get('error','')}")
+                            except Exception as e:
+                                st.exception(e)
+
+# -------------------- Step 2: Sentence & Keyword/Span Selection --------------------
 with st.container(border=True):
     st.subheader("2) Sentence & Keyword/Span Selection")
     prod = _get_production_output(st.session_state.get("results"))
-    sent_idx, sent_obj = make_sentence_selector(prod, st.session_state["selected_sentence_idx"])
+
+    sent_idx = st.session_state["selected_sentence_idx"]
+    sent_obj = None
+    if prod and len(prod.get("sentence_analyses", [])):
+        sent_idx, sent_obj = make_sentence_selector(prod, sent_idx)
 
     # default: reset terms when sentence changes, unless persistence is enabled
     reset_terms_on_sentence_change(
@@ -282,33 +544,70 @@ with st.container(border=True):
     if not sent_obj:
         st.info("Run analysis (document) or switch to corpus mode.")
     else:
-        st.write("**DEBUG: Sentence object keys:**", list(sent_obj.keys()))
-        if "span_analysis" in sent_obj:
-            st.write("**DEBUG: span_analysis:**", sent_obj["span_analysis"])
-        if "token_analysis" in sent_obj:
-            st.write("**DEBUG: token_analysis:**", sent_obj["token_analysis"])
-        
-        clicked_term = render_sentence_text_with_chips(
+        _ensure_query_builder()
+
+        # 2a) Inline overlay (visual, not clickable)
+        prod = _get_production_output(st.session_state.get("results"))
+        if prod:
+            html_overlay = render_sentence_overlay(
+                prod, st.session_state["selected_sentence_idx"],
+                highlight_coref=True,
+                box_spans=True,  # keep boxes for spans
+            )
+            st.markdown(html_overlay, unsafe_allow_html=True)
+
+        # 2b) Compact chip bar (Top-K tokens + spans)
+        clicked_term = render_topk_chip_bar(
             sent_obj,
-            candidate_source=st.session_state["config_ui"]["candidate_source"],
-            clickable_tokens=st.session_state["config_ui"]["clickable_tokens"],
+            topk_tokens=st.session_state["config_explain"]["topk_tokens_chips"],
+            topk_spans=st.session_state["config_explain"]["topk_spans_chips"],
+            min_abs_importance=st.session_state["config_explain"]["min_abs_importance"],
             pos_threshold=st.session_state["config_explain"]["positive_thr"],
             neg_threshold=st.session_state["config_explain"]["negative_thr"],
-            kpe_top_k=st.session_state["config_explain"]["kpe_top_k"],
-            kpe_threshold=st.session_state["config_explain"]["kpe_threshold"],
-            debug=True
+            candidate_source=st.session_state["config_ui"]["candidate_source"],
         )
-        if clicked_term and clicked_term not in st.session_state["query_terms"]:
-            st.session_state["query_terms"].append(clicked_term)
-            toast_info(f"Added term: {clicked_term}")
+        if clicked_term:
+            handle_clicked_term(clicked_term)
+            toast_info(f"Added to phrase: {clicked_term}")
 
-        st.caption("Selected terms")
-        c1, c2 = st.columns([3, 1])
+        if st.session_state["config_ui"]["clickable_tokens"]:
+            clicked2 = render_clickable_token_strip(
+                sent_obj,
+                max_per_row=10,
+                pos_threshold=st.session_state["config_explain"]["positive_thr"],
+                neg_threshold=st.session_state["config_explain"]["negative_thr"],
+            )
+            if clicked2:
+                handle_clicked_term(clicked2)
+                toast_info(f"Added to phrase: {clicked2}")
+
+        # 2c) Phrase builder panel
+        qb = st.session_state["query_builder"]
+        st.caption("🧱 Phrase builder (click chips to add)")
+        st.code(qb["current_phrase"] or "—", language=None)
+        c1, c2, c3, c4 = st.columns([1, 1, 2, 4])
         with c1:
-            st.code(", ".join(st.session_state["query_terms"]) or "—")
+            if st.button("Undo last"):
+                undo_last_token()
         with c2:
-            if st.button("Clear terms"):
-                st.session_state["query_terms"] = []
+            if st.button("Clear"):
+                clear_phrase_builder()
+        with c3:
+            if st.button("Commit phrase ✅", type="primary"):
+                commit_current_phrase()
+        with c4:
+            st.caption(f"{len(qb['active_tokens'])} tokens in current phrase")
+
+        st.caption("✅ Committed phrases")
+        if qb["phrases"]:
+            cols = st.columns(min(6, max(2, len(qb["phrases"]))))
+            for i, ph in enumerate(qb["phrases"]):
+                with cols[i % len(cols)]:
+                    st.write(f"`{ph}`")
+                    if st.button("✕", key=f"rm_phrase_{i}"):
+                        remove_phrase(i)
+        else:
+            st.write("--")
 
 # -------------------- Steps 3 & 4 (side-by-side or stacked) --------------------
 if layout_side_by_side:
@@ -330,7 +629,7 @@ with col4:
     with st.container(border=True):
         st.subheader("4) Concordance / Communities & Clusters")
 
-        # A) Concordance (corpus mode only)
+        # A) Concordance (corpus mode only, DB-backed)
         if st.session_state["config_ui"]["mode"] == "corpus":
             db_path = st.session_state["db_path"]
             if Path(db_path).exists() and st.session_state["query_terms"]:
@@ -365,6 +664,9 @@ with col4:
                 )
         else:
             st.caption("SciCo: add terms and click the button (or enable auto-run).")
+
+        # C) Single-doc in-memory concordance (works for both doc mode and fresh corpus analysis)
+        _render_single_doc_concordance()
 
 # -------------------- Footer --------------------
 st.markdown("---")
