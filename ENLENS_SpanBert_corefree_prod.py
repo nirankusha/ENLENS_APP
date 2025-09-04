@@ -83,13 +83,12 @@ def _classify_dual(sentence: str,
 
 def run_quick_analysis(pdf_file: str, max_sentences: int = 30,
                        max_span_len: int = 4, top_k_spans: int = 8,
-                       # Add the missing SDG consensus parameters
+                       # SDG consensus parameters
                        agree_threshold: float = 0.1,
                        disagree_threshold: float = 0.2,
                        min_confidence: float = 0.5,
                        # Accept other kwargs that might be passed by the bridge
                        **kwargs) -> Dict[str, Any]:
-    
     # Extract max_text_length if provided
     max_text_length = kwargs.get("max_text_length")
 
@@ -99,12 +98,116 @@ def run_quick_analysis(pdf_file: str, max_sentences: int = 30,
     else:
         full_text = preprocess_pdf_text(raw)
 
+    # sentence index + interval tree
     sid2span, sent_tree = build_sentence_index(full_text)
 
-    coref = analyze_full_text_coreferences(full_text) or {}
-    chains = normalize_chain_mentions(coref.get("chains", []) or [])
+    # ---- Coref scope switch ----
+    backend = kwargs.get("coref_backend", "fastcoref")  # "fastcoref" | "lingmess"
+    scope   = kwargs.get("coref_scope", "whole_document")  # keep your windowed option if you like
+    resolved_text = None
+
+    def _tag_pair(ant_txt, ana_txt, ant_is_pron, ana_is_pron):
+       if ant_is_pron and ana_is_pron:
+           return "PRON-PRON-C"   # within-chain pron↔pron co-ref
+       if ant_txt == ana_txt:
+           return "MATCH"
+       if ant_txt in ana_txt or ana_txt in ant_txt:
+           return "CONTAINS"
+       if (not ant_is_pron) and ana_is_pron:
+           return "ENT-PRON"
+       return "OTHER"
+
+    if backend == "lingmess":
+       # Preferred: spaCy component → doc._.coref_clusters & doc._.resolved_text
+       try:
+           import spacy
+           from fastcoref import spacy_component  # register "fastcoref" pipe
+           # Use your existing nlp if available; else create a blank pipeline
+           try:
+               _nlp = nlp  # from helper
+           except Exception:
+               _nlp = spacy.blank("en")
+           if "fastcoref" not in _nlp.pipe_names:
+               _nlp.add_pipe("fastcoref", config={
+                   "model_architecture": "LingMessCoref",
+                   "device": kwargs.get("coref_device", "cuda:0"),
+                   "resolve_text": kwargs.get("resolve_text", True)
+               })
+           doc = _nlp(full_text)
+
+           # Build chains
+           chains = []
+           for cid, cluster in enumerate(doc._.coref_clusters):
+               # cluster is a list of Span objects
+               mentions = []
+               for sp in cluster:
+                   mentions.append({
+                       "text": sp.text,
+                       "start_char": sp.start_char,
+                       "end_char": sp.end_char,
+                       # enrich later with sent_id; POS/pronoun flags:
+                       "is_pronoun": (sp.root.pos_ == "PRON"),
+                       "head_pos": sp.root.pos_
+                   })
+               # representative = longest mention by char length
+               representative = max(mentions, key=lambda m: len(m["text"]))["text"] if mentions else ""
+               chains.append({"chain_id": cid, "representative": representative, "mentions": mentions})
+
+           # Optional resolved text (if resolve_text=True was given)
+           if getattr(doc._, "resolved_text", None):
+               resolved_text = str(doc._.resolved_text)
+
+           # Add antecedent edges + 6-way tags (approx.)
+           # Heuristic antecedent = closest previous non-pronoun in cluster; else previous mention
+           for ch in chains:
+               m = ch["mentions"]
+               edges = []
+               last_non_pron = None
+               for i in range(1, len(m)):
+                   ant_idx = last_non_pron if last_non_pron is not None else (i - 1)
+                   ant = m[ant_idx]; ana = m[i]
+                   tag = _tag_pair(ant["text"], ana["text"], ant.get("is_pronoun", False), ana.get("is_pronoun", False))
+                   edges.append({"antecedent": ant_idx, "anaphor": i, "tag": tag})
+                   if not ana.get("is_pronoun", False):
+                       last_non_pron = i
+               ch["edges"] = edges
+
+       except Exception as e:
+           # Fallback to default whole-document fastcoref
+           coref = analyze_full_text_coreferences(full_text) or {}
+           chains = normalize_chain_mentions(coref.get("chains", []) or [])
+
+    else:
+       # Existing fastcoref path (your current behavior)
+       if scope == "windowed":
+           from helper import _fastcoref_in_windows
+           clust = _fastcoref_in_windows(
+               full_text,
+               k_sentences=int(kwargs.get("coref_window_sentences", 3)),
+               stride=int(kwargs.get("coref_window_stride", 2)),
+           )
+           chains = []
+           for cid, cluster in enumerate(clust):
+               mentions = [{"text": full_text[s:e], "start_char": s, "end_char": e} for (s, e) in cluster]
+               if mentions:
+                   representative = max(mentions, key=lambda m: len(m["text"]))["text"]
+                   chains.append({"chain_id": cid, "representative": representative, "mentions": mentions})
+       else:
+           coref = analyze_full_text_coreferences(full_text) or {}
+           chains = normalize_chain_mentions(coref.get("chains", []) or [])
+    # Enrich mentions with sent_id for the UI (widget 3)
+    for ch in chains:
+        for m in ch.get("mentions", []) or []:
+            s0 = int(m.get("start_char", -1))
+            if s0 >= 0:
+                hits = sent_tree.at(s0)  # payloads: {"sid": int, "start": int, "end": int}
+                if hits:
+                    m["sent_id"] = hits[0]["sid"]
+
+    # Build interval trees once per chain for quick lookups later
     chain_trees = _build_chain_trees(chains)
 
+    # sentence list (clip to max_sentences)
     sentences = extract_and_filter_sentences(full_text)
     if len(sentences) > max_sentences:
         sentences = sentences[:max_sentences]
@@ -113,14 +216,15 @@ def run_quick_analysis(pdf_file: str, max_sentences: int = 30,
     for idx, sent in enumerate(sentences):
         st, en = sid2span.get(idx, (full_text.find(sent), full_text.find(sent) + len(sent)))
 
-        # Pass the consensus parameters to _classify_dual
+        # Dual classifier (with your consensus knobs)
         pri, sec, cons = _classify_dual(
-            sent, 
+            sent,
             agree_threshold=agree_threshold,
             disagree_threshold=disagree_threshold,
-            min_confidence=min_confidence
+            min_confidence=min_confidence,
         )
 
+        # IG token importances (absolute offsets)
         toks, scores, offsets = token_importance_ig(sent, int(pri["label"]))
         token_items = [
             {"token": toks[i], "importance": float(scores[i]),
@@ -128,6 +232,7 @@ def run_quick_analysis(pdf_file: str, max_sentences: int = 30,
             for i in range(len(toks))
         ]
 
+        # span masking importances (top-K)
         spans = compute_span_importances(sent, target_class=int(pri["label"]), max_span_len=max_span_len)
         spans = sorted(spans, key=lambda x: float(x.get("score", 0.0)), reverse=True)[:top_k_spans]
 
@@ -138,7 +243,8 @@ def run_quick_analysis(pdf_file: str, max_sentences: int = 30,
             coref_info = _map_span_to_chain(abs_s, abs_e, chain_trees, chains)
             span_items.append({
                 "rank": rank,
-                "original_span": {"text": sp.get("text", sent[ls:le]), "start_char": abs_s, "end_char": abs_e,
+                "original_span": {"text": sp.get("text", sent[ls:le]),
+                                  "start_char": abs_s, "end_char": abs_e,
                                   "importance": float(sp.get("score", 0.0))},
                 "expanded_phrase": sp.get("text", sent[ls:le]),
                 "coords": [abs_s, abs_e],
@@ -151,7 +257,8 @@ def run_quick_analysis(pdf_file: str, max_sentences: int = 30,
             "doc_start": st, "doc_end": en,
             "classification": {"label": pri["label"], "score": pri.get("confidence"),
                                "class_id": pri["label"], "consensus": cons, "confidence": pri.get("confidence")},
-            "token_analysis": {"tokens": token_items, "max_importance": float(max(scores) if len(scores) else 0.0),
+            "token_analysis": {"tokens": token_items,
+                               "max_importance": float(max(scores) if len(scores) else 0.0),
                                "num_tokens": len(token_items)},
             "span_analysis": span_items,
             "metadata": {}
@@ -159,6 +266,7 @@ def run_quick_analysis(pdf_file: str, max_sentences: int = 30,
 
     production_output: Dict[str, Any] = {
         "full_text": full_text,
+        "resolved_text": resolved_text, 
         "document_analysis": {},
         "coreference_analysis": {"num_chains": len(chains), "chains": chains},
         "sentence_analyses": sentence_analyses

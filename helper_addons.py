@@ -296,9 +296,59 @@ def prepare_clusters(production_output: Dict[str, Any]) -> Dict[str, Any]:
                              for cl in clusters for i, a in enumerate(cl) for b in cl[i+1:]]}
     return {"clusters": clusters, "clusters_dict": {str(i): cl for i, cl in enumerate(clusters)}, "graphs_json": graphs_json}
 
-# =============================================================================
-# ### END: MERGE INTO helper.py
-# =============================================================================
+def build_alignment_map(original: str, resolved: str, replacements: List[Tuple[int,int,str]]) -> List[Tuple[int,int,int,int]]:
+    """
+    Build sparse alignment between original and resolved after replacements.
+    replacements: list of (start,end,rep_text) applied left→right on original.
+    Returns list of (orig_start, orig_end, res_start, res_end) ranges.
+    """
+    spans = []
+    o_cursor = 0
+    r_cursor = 0
+    last = 0
+    res_text = []
+    for s,e,rep in replacements:
+        # keep original chunk
+        if s > last:
+            chunk = original[last:s]
+            res_text.append(chunk)
+            L = len(chunk)
+            spans.append((last, s, r_cursor, r_cursor+L))
+            r_cursor += L
+        # replaced chunk
+        rep_str = str(rep)
+        res_text.append(rep_str)
+        spans.append((s, e, r_cursor, r_cursor+len(rep_str)))
+        r_cursor += len(rep_str)
+        last = e
+    # tail
+    if last < len(original):
+        chunk = original[last:]
+        res_text.append(chunk)
+        L = len(chunk)
+        spans.append((last, len(original), r_cursor, r_cursor+L))
+        r_cursor += L
+    # sanity: "".join(res_text) == resolved
+    return spans
+
+def debug_coref_clusters(production_output):
+    chains = (production_output.get("coreference_analysis") or {}).get("chains") or []
+    stats = []
+    for ch in chains:
+        cid = ch["chain_id"]
+        m = ch.get("mentions", [])
+        e = ch.get("edges", [])
+        tags = {}
+        for ed in e:
+            tags[ed["tag"]] = tags.get(ed["tag"], 0) + 1
+        stats.append({
+            "chain": cid,
+            "mentions": len(m),
+            "sent_spread": len({mm.get("sent_id") for mm in m if mm.get("sent_id") is not None}),
+            "tags": tags,
+            "repr": ch.get("representative","")[:40]
+        })
+    return stats
 
 """
 Created on Sat Aug 16 17:04:29 2025

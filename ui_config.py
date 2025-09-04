@@ -48,6 +48,7 @@ COREF_CONFIG = {
     "engine": "fastcoref",
     "device": "auto",
     "scope": "whole_document",
+    "resolve_text": True,
     "window_sentences": 10,
     "window_stride": 5,
     "max_chains": 200,

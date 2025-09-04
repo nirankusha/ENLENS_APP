@@ -235,14 +235,16 @@ with st.sidebar:
     # Knobs — Coreference
     with st.expander("Coreference (fastcoref)", expanded=False):
         cfg = st.session_state["config_coref"]
-        cfg["scope"] = st.selectbox(
-            "scope", ["whole_document", "windowed"],
-            index=0 if cfg["scope"] == "whole_document" else 1
-        )
+        cfg["engine"] = st.selectbox("engine", ["fastcoref", "lingmess"],
+                             index=["fastcoref","lingmess"].index(cfg.get("engine","fastcoref")))
+        cfg["device"] = st.text_input("device", value=cfg.get("device","cuda:0"))
+        cfg["resolve_text"] = st.checkbox("resolve_text", value=cfg.get("resolve_text", True))
+
+        cfg["scope"] = st.selectbox("scope", ["whole_document","windowed"],
+                            index=0 if cfg["scope"]=="whole_document" else 1)
         if cfg["scope"] == "windowed":
             cfg["window_sentences"] = st.number_input("window_sentences", 3, 200, cfg["window_sentences"])
-            cfg["window_stride"] = st.number_input("window_stride", 1, 200, cfg["window_stride"])
-
+            cfg["window_stride"]    = st.number_input("window_stride", 1, 200, cfg["window_stride"])
     # Knobs — SciCo shortlist/cluster/community/summaries
     with st.expander("SciCo (shortlist → cluster → communities → summaries)", expanded=False):
         cfg = st.session_state["config_scico"]
@@ -499,10 +501,12 @@ with st.container(border=True):
                                     top_k_spans=st.session_state["config_explain"]["top_k_spans"],
                                     kpe_top_k=st.session_state["config_explain"]["kpe_top_k"],
                                     kpe_threshold=st.session_state["config_explain"]["kpe_threshold"],
+                                    coref_backend=st.session_state["config_coref"]["engine"],
+                                    coref_device=st.session_state["config_coref"]["device"],
+                                    resolve_text=st.session_state["config_coref"]["resolve_text"],
                                     coref_scope=st.session_state["config_coref"]["scope"],
                                     coref_window_sentences=st.session_state["config_coref"].get("window_sentences"),
-                                    coref_window_stride=st.session_state["config_coref"].get("window_stride"),
-                                    agree_threshold=st.session_state["config_sdg"]["agree_threshold"],
+                                    coref_window_stride=st.session_state["config_coref"].get("window_stride"),agree_threshold=st.session_state["config_sdg"]["agree_threshold"],
                                     disagree_threshold=st.session_state["config_sdg"]["disagree_threshold"],
                                     min_confidence=st.session_state["config_sdg"]["min_confidence"],
                                 )

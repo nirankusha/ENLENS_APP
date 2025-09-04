@@ -101,10 +101,13 @@ def run_ingestion_quick(
     top_k_spans: int | None = None,
     kpe_top_k: int | None = None,
     kpe_threshold: float | None = None,
-    # fastcoref knobs (if your pipeline exposes them)
+    # fastcoref knobs
     coref_scope: str | None = None,            # 'whole_document' | 'windowed'
     coref_window_sentences: int | None = None,
     coref_window_stride: int | None = None,
+    coref_backend: str | None = None,       
+    coref_device: str | None = None,        
+    resolve_text: bool | None = None,       
     # sdg / consensus (if exposed)
     agree_threshold: float | None = None,
     disagree_threshold: float | None = None,
@@ -141,8 +144,12 @@ def run_ingestion_quick(
             pdf_file=pdf_path,
             max_sentences=max_sentences,
             max_text_length=max_text_length,
-            max_span_len=max_span_len,
-            top_k_spans=top_k_spans,
+            coref_scope=coref_scope,
+            coref_window_sentences=coref_window_sentences,
+            coref_window_stride=coref_window_stride,
+            coref_backend=coref_backend,     
+            coref_device=coref_device,       
+            resolve_text=resolve_text,       
             agree_threshold=agree_threshold,
             disagree_threshold=disagree_threshold,
             min_confidence=min_confidence,
@@ -245,42 +252,40 @@ def build_concordance(sqlite_path: str, terms: List[str], and_mode=True):
 
 
 def pick_sentence_coref_groups(production_output: Dict[str, Any], sent_idx: int):
-    """
-    From your production output structure: collect chains that include the sentence,
-    return {chain_id: [ {sid, text, score?}, ... ] }
-    """
-    chains = (production_output.get("coreference_analysis")
-              or {}).get("chains") or []
-    sents = production_output.get("sentence_analyses") or []
+    chains = (production_output.get("coreference_analysis") or {}).get("chains") or []
+    sents  = production_output.get("sentence_analyses") or []
     if not chains or sent_idx is None or sent_idx >= len(sents):
         return {}
 
-    # naive mapping: if any mention in the chain falls into this sentence span, we include it
     out = {}
-    target = sents[sent_idx]
-    t0, t1 = target.get("doc_start"), target.get("doc_end")
-    if t0 is None or t1 is None:
-        return {}
+    for chain in chains:
+        mentions = chain.get("mentions") or []
+        edges    = chain.get("edges") or []
+        # map anaphor index -> tag (pick first if multiple)
+        tag_by_anaph = {int(e["anaphor"]): e.get("tag") for e in edges if isinstance(e, dict) and "anaphor" in e}
 
-    for ci, chain in enumerate(chains):
-        members = []
-        for m in chain.get("mentions", []):
-            s = m.get("sent_id")
-            start = m.get("start_char")
-            end = m.get("end_char")
-            score = m.get("score", None)
-            if s is None or s >= len(sents):
+        # group chain mentions by sentence id for display
+        sent_map: dict[int, dict] = {}
+        for i, m in enumerate(mentions):
+            sid = m.get("sent_id")
+            if sid is None or sid >= len(sents):
                 continue
-            # include all mentions in chain; we’ll rely on UI list for display
-            members.append(dict(
-                sid=s,
-                text=sents[s].get("sentence_text", ""),
-                score=score
-            ))
-        if members:
-            out[ci] = members
-    return out
+            rec = sent_map.setdefault(sid, {
+                "sid": sid,
+                "text": sents[sid].get("sentence_text", ""),
+                "mentions": []
+            })
+            rec["mentions"].append({
+                "text": m.get("text",""),
+                "start_char": m.get("start_char"),
+                "end_char": m.get("end_char"),
+                "tag": tag_by_anaph.get(i)  # may be None for first/standalone
+            })
 
+        # only include chains that touch the selected sentence
+        if sent_idx in sent_map:
+            out[int(chain.get("chain_id", 0))] = list(sent_map.values())
+    return out
 
 def compute_sentence_clusters_for_doc(G, meta, sent_idx: int):
     # Placeholder if you later want to compute detailed cluster membership lists

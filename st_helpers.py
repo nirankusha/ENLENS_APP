@@ -272,30 +272,87 @@ def render_sentence_text_with_chips(
     return clicked
 
 # ---------- panels ----------
+#def render_coref_panel(coref_groups, production_output, mode="document"):
+#    """
+#    coref_groups: { chain_id: [ {sid, text, mentions:[{text,start_char,end_char,tag}]}, ... ] }
+#    """
+#    if not coref_groups:
+#        st.info("No coreference chains for this sentence.")
+#        return
+#
+#    for cid, items in sorted(coref_groups.items()):
+#        with st.expander(f"Chain {cid} (sentences: {len(items)})", expanded=False):
+#            # show sentences in order
+#            for row in sorted(items, key=lambda r: r.get("sid", 10**9)):
+#                sid = row.get("sid")
+#                sents = production_output.get("sentence_analyses") or []
+#
+#                # fetch sentence text safely
+#                s_txt = ""
+#                if isinstance(sid, int) and 0 <= sid < len(sents):
+#                    s_txt = sents[sid].get("sentence_text", "") or ""
+#                s_txt = s_txt.replace("\n", " ")[:160]
+#
+#                st.markdown(f"- **sent {sid}** — {html.escape(s_txt)}")
+#
+#                # per-mention list with optional tag
+#                for m in row.get("mentions", []):
+#                    tag = m.get("tag")
+#                    tag_str = f" [{tag}]" if tag else ""
+#                    start = m.get("start_char", m.get("start", "?"))
+#                    end   = m.get("end_char",   m.get("end",   "?"))
+#
+#                    st.markdown(
+#                        f"&nbsp;&nbsp;• {html.escape(m.get('text',''))}{tag_str} ({start}:{end})",
+#                        unsafe_allow_html=True
+#                    )
+
 def render_coref_panel(coref_groups, production_output, mode="document"):
-    """coref_groups: dict(chain_id -> list[{sid, text, score?}])"""
+    """
+    coref_groups: { chain_id: [ {sid, text, mentions:[{text,start_char,end_char,tag}]}, ... ] }
+    """
     if not coref_groups:
         st.info("No coreference chains for this sentence.")
         return
+
+    TAG_COLORS = {
+        "PRON-PRON-C": "#6e8efb",
+        "PRON-PRON-NC": "#a1a1a1",
+        "ENT-PRON": "#56b881",
+        "MATCH": "#e6b422",
+        "CONTAINS": "#e86a5f",
+        "OTHER": "#999999",
+        None: "#cccccc",
+    }
+
     for cid, items in coref_groups.items():
-        with st.expander(f"Chain {cid} (members: {len(items)})", expanded=False):
-            for it in items:
-                sid = it.get("sid")
-                txt = (it.get("text", "") or "").replace("\n", " ")[:160]
-                score = it.get("score", None)
-                meta = None
-                try:
-                    meta = production_output.get("sentence_analyses", [])[sid] if sid is not None else None
-                except Exception:
-                    meta = None
-                label = meta.get("classification", {}).get("label") if meta else None
-                cons = meta.get("classification", {}).get("consensus") if meta else None
-                st.markdown(
-                    f"- **{sid}** — {html.escape(txt)}"
-                    f"{' | ' + str(label) if label else ''}"
-                    f"{' | ' + str(cons) if cons else ''}"
-                    f"{f' | score={score:.2f}' if isinstance(score, (int, float)) else ''}"
-                )
+        with st.expander(f"Chain {cid} • sentences: {len(items)}", expanded=False):
+            for row in sorted(items, key=lambda r: r.get("sid", 10**9)):
+                # FIX: build/clean sentence text first (no stray brace), with safe fallback
+                if "text" in row and isinstance(row["text"], str):
+                    sent_text = row["text"]
+                else:
+                    sents = production_output.get("sentence_analyses") or []
+                    sid = row.get("sid")
+                    sent_text = (sents[sid].get("sentence_text", "") if isinstance(sid, int) and 0 <= sid < len(sents) else "")
+                sent_text = sent_text.replace("\n", " ")[:200]
+                st.markdown(f"**Sentence {row.get('sid', '?')}** — {html.escape(sent_text)}")
+
+                # Mentions with color-coded tag chips
+                for m in row.get("mentions", []):
+                    tag = m.get("tag")
+                    color = TAG_COLORS.get(tag, "#999")
+                    mention_text = html.escape(m.get("text", ""))
+                    start = m.get("start_char", m.get("start", "?"))
+                    end   = m.get("end_char",   m.get("end",   "?"))
+
+                    st.markdown(
+                        f"<span style='display:inline-block;padding:2px 6px;border-radius:6px;"
+                        f"background:{color};color:white;font-size:11px;margin-right:6px;'>{tag or '—'}</span>"
+                        f"<code>{mention_text}</code> "
+                        f"[{start}:{end}]",
+                        unsafe_allow_html=True,
+                    )
 
 def render_concordance_panel(conc_results):
     if not conc_results:
@@ -307,6 +364,7 @@ def render_concordance_panel(conc_results):
             f"- `{r.get('path','')}` [{r.get('start','?')}:{r.get('end','?')}] — "
             f"{(r.get('text','') or '')[:160]}"
         )
+
 
 def _normalize_spacing(tokens: list[str]) -> str:
     """
