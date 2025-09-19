@@ -41,7 +41,6 @@ from global_coref_helper import (
 )
 
 from span_chains import _map_span_to_chain, _build_chain_trees
-from lingmess_coref import make_lingmess_nlp, run_lingmess_coref
 
 # ---------- main ----------
 def _classify_dual(sentence: str, 
@@ -60,18 +59,14 @@ def _classify_dual(sentence: str,
     secondary = {"label": (None if si_lab is None else int(si_lab)), "code": si_code, "confidence": float(si_conf)}
     return primary, secondary, cons
 
-def run_quick_analysis(
-    pdf_file: str,
-    max_sentences: int = 30,
-    max_span_len: int = 4,
-    top_k_spans: int = 8,
-    # SDG consensus parameters
-    agree_threshold: float = 0.1,
-    disagree_threshold: float = 0.2,
-    min_confidence: float = 0.5,
-    # Accept other kwargs that might be passed by the bridge
-    **kwargs
-) -> Dict[str, Any]:
+def run_quick_analysis(pdf_file: str, max_sentences: int = 30,
+                       max_span_len: int = 4, top_k_spans: int = 8,
+                       # SDG consensus parameters
+                       agree_threshold: float = 0.1,
+                       disagree_threshold: float = 0.2,
+                       min_confidence: float = 0.5,
+                       # Accept other kwargs that might be passed by the bridge
+                       **kwargs) -> Dict[str, Any]:
     # Extract max_text_length if provided
     max_text_length = kwargs.get("max_text_length")
 
@@ -81,18 +76,24 @@ def run_quick_analysis(
     else:
         full_text = preprocess_pdf_text(raw)
 
-    # sentence index + interval tree (absolute offsets)
+    # sentence index + interval tree
     sid2span, sent_tree = build_sentence_index(full_text)
+    # after: sid2span, sent_tree = build_sentence_index(full_text)
+    sentences = [full_text[st:en] for _, (st, en) in sorted(sid2span.items())]
+    if len(sentences) > max_sentences:
+        sentences = sentences[:max_sentences]
 
-    # ---- Coref scope/backend switches ----
-    sentence_analyses = None,
+    for idx, sent in enumerate(sentences):
+        st, en = sid2span[idx]
+
+    # ---- Coref scope switch ----
     backend = kwargs.get("coref_backend", "fastcoref")  # "fastcoref" | "lingmess"
     scope   = kwargs.get("coref_scope", "whole_document")
     resolved_text = None
-    
+
     def _tag_pair(ant_txt, ana_txt, ant_is_pron, ana_is_pron):
         if ant_is_pron and ana_is_pron:
-            return "PRON-PRON-C"
+            return "PRON-PRON-C"   # within-chain pron↔pron co-ref
         if ant_txt == ana_txt:
             return "MATCH"
         if ant_txt in ana_txt or ana_txt in ant_txt:
@@ -101,54 +102,60 @@ def run_quick_analysis(
             return "ENT-PRON"
         return "OTHER"
 
-    # ---------------- LingMess backend ----------------
     if backend == "lingmess":
-        chains = []
+        # spaCy+fastcoref LingMessCoref pipeline
         try:
-            # Use helper for robust parsing + edges
-            from fast_coref.spacy_component import spacy_component
-            from lingmess_coref import make_lingmess_nlp, run_lingmess_coref
-            
-            coref_device = kwargs.get("coref_device", "cpu")
-            want_resolved = bool(kwargs.get("resolve_text", True))
+            import spacy
+            from fastcoref import spacy_component  # registers pipe
+            try:
+                _nlp = nlp  # from helper
+            except Exception:
+                _nlp = spacy.blank("en")
+            if "fastcoref" not in _nlp.pipe_names:
+                _nlp.add_pipe("fastcoref", config={
+                    "model_architecture": "LingMessCoref",
+                    "device": kwargs.get("coref_device", "cuda:0"),
+                    "resolve_text": kwargs.get("resolve_text", True)
+                })
+            doc = _nlp(full_text)
 
-            nlp, resolver = make_lingmess_nlp(device=coref_device, eager_attention=True)
+            chains = []
+            for cid, cluster in enumerate(doc._.coref_clusters):
+                mentions = []
+                for sp in cluster:
+                    mentions.append({
+                        "text": sp.text,
+                        "start_char": sp.start_char,
+                        "end_char": sp.end_char,
+                        "is_pronoun": (sp.root.pos_ == "PRON"),
+                        "head_pos": sp.root.pos_
+                    })
+                representative = max(mentions, key=lambda m: len(m["text"]))["text"] if mentions else ""
+                chains.append({"chain_id": cid, "representative": representative, "mentions": mentions})
 
-            # sentence_analyses not available yet; we’ll add sent_ids below from sent_tree anyway
-            lm = run_lingmess_coref(
-                full_text,
-                nlp,
-                resolver=resolver,
-                sentence_analyses=None
-            )
-            chains = lm.get("chains", []) or []
+            if getattr(doc._, "resolved_text", None):
+                resolved_text = str(doc._.resolved_text)
 
-            # Normalize edges to your app’s schema: {antecedent, anaphor, tag}
+            # Add simple antecedent edges with tags
             for ch in chains:
-                conv = []
-                for e in ch.get("edges") or []:
-                    i = e.get("i", e.get("antecedent", -1))
-                    j = e.get("j", e.get("anaphor", -1))
-                    rel = e.get("relation") or e.get("tag") or "OTHER"
-                    try:
-                        i = int(i); j = int(j)
-                    except Exception:
-                        continue
-                    if i >= 0 and j >= 0:
-                        conv.append({"antecedent": i, "anaphor": j, "tag": str(rel)})
-                ch["edges"] = conv
-
-            # Optionally capture resolved text
-            if want_resolved and lm.get("resolved_text"):
-                resolved_text = lm["resolved_text"]
+                m = ch["mentions"]
+                edges = []
+                last_non_pron = None
+                for i in range(1, len(m)):
+                    ant_idx = last_non_pron if last_non_pron is not None else (i - 1)
+                    ant = m[ant_idx]; ana = m[i]
+                    tag = _tag_pair(ant["text"], ana["text"], ant.get("is_pronoun", False), ana.get("is_pronoun", False))
+                    edges.append({"antecedent": ant_idx, "anaphor": i, "tag": tag})
+                    if not ana.get("is_pronoun", False):
+                        last_non_pron = i
+                ch["edges"] = edges
 
         except Exception:
-            # Fallback to your legacy analyzer
             coref = analyze_full_text_coreferences(full_text) or {}
             chains = normalize_chain_mentions(coref.get("chains", []) or [])
-            
-    # ---------------- fastcoref default backend ----------------
+
     else:
+        # fastcoref default path
         if scope == "windowed":
             clust = _fastcoref_in_windows(
                 full_text,
@@ -165,29 +172,27 @@ def run_quick_analysis(
             coref = analyze_full_text_coreferences(full_text) or {}
             chains = normalize_chain_mentions(coref.get("chains", []) or [])
 
-    # ------------- Enrich mentions with sent_id via interval tree -------------
+    # Enrich mentions with sent_id for the UI
     for ch in chains:
         for m in ch.get("mentions", []) or []:
             s0 = int(m.get("start_char", -1))
             if s0 >= 0:
-                hits = sent_tree.at(s0)
-            if hits:
-                m["sent_id"] = hits[0]["sid"]
-    # ------------- Build interval trees per chain (for fast mapping) ----------
+                hits = sent_tree.at(s0)  # payloads: {"sid": int, "start": int, "end": int}
+                if hits:
+                    m["sent_id"] = hits[0]["sid"]
+
+    # Build interval trees once per chain for quick lookups later
     chain_trees = _build_chain_trees(chains)
-
-    # ------------- Build indices for shortlist (trie/cooc) --------------------
-    from helper_addons import build_ngram_index, build_cooc_graph
-
-    char_n   = kwargs.get("trie_char_n", None)                # None disables char-grams
+    
+    char_n   = kwargs.get("trie_char_n", None)                 # None = disable char grams
     token_ns = tuple(kwargs.get("trie_token_ns", (2, 3, 4)))
 
     ng_index = build_ngram_index(
         chains,
         token_ns=token_ns,
         char_n=char_n,
-        build_trie=True,
-    )
+        build_trie=True,   # fast in-memory path for ENLENS
+        )
 
     shortlist_mode = str(kwargs.get("coref_shortlist_mode", "off")).lower()  # "off"|"trie"|"cooc"|"both"
     if shortlist_mode in ("cooc", "both"):
@@ -201,11 +206,12 @@ def run_quick_analysis(
             cooc_impl=kwargs.get("cooc_impl", "fast"),
             cooc_max_tokens=int(kwargs.get("cooc_max_tokens", 50000)),
             cache_key=hash(full_text) % (10**9),
-        )
+        )   
     else:
         vocab, rows, row_norms = {}, [], {}
-
-    # Shortlist knobs
+    
+    # Shortlist knobs (optionally passed via kwargs)
+     
     topk             = int(kwargs.get("coref_shortlist_topk", 5))
     tau_trie         = float(kwargs.get("coref_trie_tau", 0.18))
     tau_cooc         = float(kwargs.get("coref_cooc_tau", 0.18))
@@ -213,14 +219,13 @@ def run_quick_analysis(
     scorer_threshold = float(kwargs.get("coref_scorer_threshold", 0.25))
     pair_scorer      = kwargs.get("coref_pair_scorer", None) if use_scorer else None
 
-    # ---------------- Sentence list (clip to max_sentences) -------------------
+    # sentence list (clip to max_sentences)
     sentences = extract_and_filter_sentences(full_text)
     if len(sentences) > max_sentences:
         sentences = sentences[:max_sentences]
 
     sentence_analyses: List[Dict[str, Any]] = []
     for idx, sent in enumerate(sentences):
-        # robust absolute bounds from sid2span; fallback if missing
         st, en = sid2span.get(idx, (full_text.find(sent), full_text.find(sent) + len(sent)))
 
         # Dual classifier (with consensus knobs)
@@ -239,7 +244,7 @@ def run_quick_analysis(
             for i in range(len(toks))
         ]
 
-        # Span masking importances (top-K)
+        # span masking importances (top-K)
         spans = compute_span_importances(sent, target_class=int(pri["label"]), max_span_len=max_span_len)
         spans = sorted(spans, key=lambda x: float(x.get("score", 0.0)), reverse=True)[:top_k_spans]
 
@@ -248,15 +253,15 @@ def run_quick_analysis(
             ls, le = int(sp.get("start", 0)), int(sp.get("end", 0))
             abs_s, abs_e = st + ls, st + le
 
-            # Build query text from normalized variants
+            # robust query string from normalized variants (sentence-local)
             try:
                 variants = normalize_span_for_chaining(sent, ls, le)
                 variant_texts = [v[0] for v in variants] or [sp.get("text", sent[ls:le])]
             except Exception:
                 variant_texts = [sp.get("text", sent[ls:le])]
-            query_text = " ; ".join(dict.fromkeys(variant_texts))[:500]
+            query_text = " ; ".join(dict.fromkeys(variant_texts))[:500]  # cap length
 
-            # Shortlist candidate chains
+            # shortlist candidate chains
             cand_ids: List[int] = []
             triers: List[Tuple[int, float]] = []
             coocs:  List[Tuple[int, float]] = []
@@ -281,13 +286,14 @@ def run_quick_analysis(
             else:  # "off"
                 cand_ids = []
 
-            # Map span → chain (with optional scorer)
+            # call mapper with candidates; fallback to old behavior if empty
             coref_info = _map_span_to_chain(
                 abs_s, abs_e, chain_trees, chains,
                 cand_chain_ids=cand_ids if cand_ids else None,
                 scorer=pair_scorer, threshold=(scorer_threshold if pair_scorer else None),
             )
 
+            # keep existing schema; optionally record provenance
             span_items.append({
                 "rank": rank,
                 "original_span": {"text": sp.get("text", sent[ls:le]),
@@ -315,7 +321,6 @@ def run_quick_analysis(
             "metadata": {}
         })
 
-    
     production_output: Dict[str, Any] = {
         "full_text": full_text,
         "resolved_text": resolved_text,
@@ -323,25 +328,17 @@ def run_quick_analysis(
         "coreference_analysis": {"num_chains": len(chains), "chains": chains},
         "sentence_analyses": sentence_analyses
     }
-    
-    production_output.setdefault("coreference_analysis", {})
-    production_output["coreference_analysis"]["backend_used"] = backend
-    production_output["coreference_analysis"]["num_chains"] = len(chains)
 
     try:
         production_output["cluster_analysis"] = prepare_clusters(production_output)
     except Exception:
         production_output["cluster_analysis"] = {"clusters": [], "clusters_dict": {}, "graphs_json": {}}
-
-    # Persist ngram index snapshot (for debugging / UI)
+    
     production_output.setdefault("indices", {})
-    try:
-        production_output["indices"]["coref_ngram"] = ng_index.to_dict()
-    except Exception:
-        production_output["indices"]["coref_ngram"] = {}
+    production_output["indices"]["coref_ngram"] = ng_index.to_dict()
 
     return production_output
- 
+
 # ---------- minimal ipywidgets UI ----------
 def create_interactive_visualization(production_output: Dict[str, Any],
                                      source: Literal["kp","span","auto"] = "span",

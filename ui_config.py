@@ -56,6 +56,12 @@ COREF_CONFIG = {
     "score_field": "score",
     "link_prune_threshold": 0.40,
     "attach_to_spans": True,
+    "coref_shortlist_mode": "trie",   # "off" | "trie" | "cooc" | "both"
+    "coref_shortlist_topk": 50,       
+    "coref_trie_tau": 0.18,           
+    "coref_cooc_tau": 0.18,           
+    "coref_use_pair_scorer": False,
+    "coref_scorer_threshold": 0.25,
 }
 
 CORPUS_INDEX_CONFIG = {
@@ -107,8 +113,9 @@ UI_CONFIG = {
     "persist_to_flexiconc": False,
     "save_graph_meta": True,
     "debug": False,
-    "persist_terms_across_sentences": False
+    "persist_terms_across_sentences": False,
 }
+
 
 """
 Created on Mon Aug 25 15:02:13 2025

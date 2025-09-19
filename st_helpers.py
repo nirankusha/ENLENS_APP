@@ -5,6 +5,15 @@ import html
 import math
 import streamlit as st
 
+_LINGMESS_REL_COLORS = {
+    "MATCH": "🟦",
+    "CONTAINS": "🟩",
+    "ENT_PRON": "🟨",
+    "PRON_PRON_C": "🟪",
+    "PRON_PRON_NC": "🟧",
+    "OTHER": "⬜",
+}
+
 # ---------- small utilities ----------
 def toast_info(msg: str):
     st.toast(msg, icon="✅")
@@ -271,45 +280,14 @@ def render_sentence_text_with_chips(
 
     return clicked
 
-# ---------- panels ----------
-#def render_coref_panel(coref_groups, production_output, mode="document"):
-#    """
-#    coref_groups: { chain_id: [ {sid, text, mentions:[{text,start_char,end_char,tag}]}, ... ] }
-#    """
-#    if not coref_groups:
-#        st.info("No coreference chains for this sentence.")
-#        return
-#
-#    for cid, items in sorted(coref_groups.items()):
-#        with st.expander(f"Chain {cid} (sentences: {len(items)})", expanded=False):
-#            # show sentences in order
-#            for row in sorted(items, key=lambda r: r.get("sid", 10**9)):
-#                sid = row.get("sid")
-#                sents = production_output.get("sentence_analyses") or []
-#
-#                # fetch sentence text safely
-#                s_txt = ""
-#                if isinstance(sid, int) and 0 <= sid < len(sents):
-#                    s_txt = sents[sid].get("sentence_text", "") or ""
-#                s_txt = s_txt.replace("\n", " ")[:160]
-#
-#                st.markdown(f"- **sent {sid}** — {html.escape(s_txt)}")
-#
-#                # per-mention list with optional tag
-#                for m in row.get("mentions", []):
-#                    tag = m.get("tag")
-#                    tag_str = f" [{tag}]" if tag else ""
-#                    start = m.get("start_char", m.get("start", "?"))
-#                    end   = m.get("end_char",   m.get("end",   "?"))
-#
-#                    st.markdown(
-#                        f"&nbsp;&nbsp;• {html.escape(m.get('text',''))}{tag_str} ({start}:{end})",
-#                        unsafe_allow_html=True
-#                    )
+import html
+from collections import Counter
+import streamlit as st
 
-def render_coref_panel(coref_groups, production_output, mode="document"):
+def render_coref_panel(coref_groups, production_output, mode: str = "document"):
     """
-    coref_groups: { chain_id: [ {sid, text, mentions:[{text,start_char,end_char,tag}]}, ... ] }
+    coref_groups: {chain_id -> [ {sid, text, mentions:[{text,start_char,end_char,tag?}, ...]}, ... ]}
+    production_output: full production dict (used to look up chain 'edges' and global 'mentions')
     """
     if not coref_groups:
         st.info("No coreference chains for this sentence.")
@@ -318,41 +296,95 @@ def render_coref_panel(coref_groups, production_output, mode="document"):
     TAG_COLORS = {
         "PRON-PRON-C": "#6e8efb",
         "PRON-PRON-NC": "#a1a1a1",
-        "ENT-PRON": "#56b881",
-        "MATCH": "#e6b422",
-        "CONTAINS": "#e86a5f",
-        "OTHER": "#999999",
-        None: "#cccccc",
+        "ENT-PRON":     "#56b881",
+        "MATCH":        "#e6b422",
+        "CONTAINS":     "#e86a5f",
+        "OTHER":        "#999999",
+        None:           "#cccccc",
     }
 
+    # Lookup for full chains (to access 'edges' and chain-level mentions)
+    chains = (production_output.get("coreference_analysis") or {}).get("chains") or []
+    chain_by_id = {int(c.get("chain_id", -1)): c for c in chains if isinstance(c, dict)}
+
     for cid, items in coref_groups.items():
+        chain = chain_by_id.get(int(cid))
+        # Summarize relationships if present
+        rel_chips_html = ""
+        edge_rows = []
+
+        if chain:
+            edges = chain.get("edges") or []
+            if edges:
+                counts = Counter(str(e.get("tag") or e.get("relation") or "OTHER") for e in edges)
+                chips = []
+                for tag, cnt in counts.items():
+                    color = TAG_COLORS.get(tag, "#999999")
+                    chips.append(
+                        f"<span style='display:inline-block;padding:2px 6px;border-radius:6px;"
+                        f"background:{color};color:white;font-size:11px;margin-right:6px;'>{html.escape(tag)}: {cnt}</span>"
+                    )
+                rel_chips_html = "".join(chips)
+
+                # Prepare a short list of edge lines using chain-level mentions by index
+                mlist = chain.get("mentions") or []
+                max_show = min(40, len(edges))
+                for e in edges[:max_show]:
+                    i = e.get("antecedent", e.get("i"))
+                    j = e.get("anaphor", e.get("j"))
+                    tag = str(e.get("tag") or e.get("relation") or "OTHER")
+                    try:
+                        i = int(i); j = int(j)
+                    except Exception:
+                        continue
+                    m1 = mlist[i]["text"] if isinstance(i, int) and 0 <= i < len(mlist) else "?"
+                    m2 = mlist[j]["text"] if isinstance(j, int) and 0 <= j < len(mlist) else "?"
+                    edge_rows.append((tag, m1, m2))
+
         with st.expander(f"Chain {cid} • sentences: {len(items)}", expanded=False):
+            # Relationships summary chips (if any)
+            if rel_chips_html:
+                st.markdown(rel_chips_html, unsafe_allow_html=True)
+
+            # Per-sentence mentions
             for row in sorted(items, key=lambda r: r.get("sid", 10**9)):
-                # FIX: build/clean sentence text first (no stray brace), with safe fallback
+                # Resolve sentence text safely
                 if "text" in row and isinstance(row["text"], str):
                     sent_text = row["text"]
                 else:
                     sents = production_output.get("sentence_analyses") or []
                     sid = row.get("sid")
-                    sent_text = (sents[sid].get("sentence_text", "") if isinstance(sid, int) and 0 <= sid < len(sents) else "")
-                sent_text = sent_text.replace("\n", " ")[:200]
-                st.markdown(f"**Sentence {row.get('sid', '?')}** — {html.escape(sent_text)}")
+                    sent_text = (sents[sid].get("sentence_text", "")
+                                 if isinstance(sid, int) and 0 <= sid < len(sents) else "")
+                st.markdown(
+                    f"**Sentence {row.get('sid', '?')}** — {html.escape(sent_text.replace(chr(10),' ')[:200])}"
+                )
 
-                # Mentions with color-coded tag chips
+                # Mentions with tag pill
                 for m in row.get("mentions", []):
                     tag = m.get("tag")
-                    color = TAG_COLORS.get(tag, "#999")
-                    mention_text = html.escape(m.get("text", ""))
+                    color = TAG_COLORS.get(tag, "#999999")
+                    mention_text = html.escape(m.get("text", "") or "")
                     start = m.get("start_char", m.get("start", "?"))
                     end   = m.get("end_char",   m.get("end",   "?"))
-
                     st.markdown(
                         f"<span style='display:inline-block;padding:2px 6px;border-radius:6px;"
-                        f"background:{color};color:white;font-size:11px;margin-right:6px;'>{tag or '—'}</span>"
-                        f"<code>{mention_text}</code> "
-                        f"[{start}:{end}]",
+                        f"background:{color};color:white;font-size:11px;margin-right:6px;'>{html.escape(tag or '--')}</span>"
+                        f"<code>{mention_text}</code> [{start}:{end}]",
                         unsafe_allow_html=True,
                     )
+
+            # Optional: show a compact edge list
+            if edge_rows:
+                with st.expander("Relationships (pairs)", expanded=False):
+                    for tag, m1, m2 in edge_rows:
+                        color = TAG_COLORS.get(tag, "#999999")
+                        st.markdown(
+                            f"<span style='display:inline-block;padding:2px 6px;border-radius:6px;"
+                            f"background:{color};color:white;font-size:11px;margin-right:6px;'>{html.escape(tag)}</span>"
+                            f"“{html.escape(m1)}” ↔ “{html.escape(m2)}”",
+                            unsafe_allow_html=True,
+                        )
 
 def render_concordance_panel(conc_results):
     if not conc_results:
@@ -413,6 +445,7 @@ def commit_current_phrase():
     if phrase and phrase not in qb["phrases"]:
         qb["phrases"].append(phrase)
         st.session_state["query_terms"] = qb["phrases"]  # sync alias
+    # FIX: this line was truncated in your file
     qb["active_tokens"].clear()
     qb["current_phrase"] = ""
 

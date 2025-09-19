@@ -423,104 +423,235 @@ with st.container(border=True):
         if not Path(db_path).exists():
             st.warning("Set a valid SQLite path.")
         else:
-            conn = None
+            import pandas as pd
+            from flexiconc_adapter import (
+                open_db,
+                export_production_to_flexiconc,
+                upsert_doc_trie,
+                upsert_doc_cooc, 
+                count_indices,
+                list_index_sizes,
+                )
+            from helper_addons import ensure_documents_table, build_ngram_trie
+            from bridge_runners import run_ingestion_quick
+
+            # (optional) co-occ support
             try:
-                from flexiconc_adapter import open_db
-                import pandas as pd
-                from helper_addons import ensure_documents_table
-                ensure_documents_table(db_path)
-                conn = open_db(db_path)
-                import pandas as pd
-                tables = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name", conn)
-                st.caption(f"Tables detected: {tables['name'].tolist()}")
+                from helper_addons import build_cooc_graph  # noqa: F401
+                HAVE_COOCC = True
+            except Exception:
+                HAVE_COOCC = False
+
+                cx = None
                 try:
-                    conn.execute("""
-                                 CREATE TABLE IF NOT EXISTS indices (
-                                     doc_id  TEXT NOT NULL,
-                                     kind    TEXT NOT NULL,
-                                     payload BLOB,
-                                     PRIMARY KEY(doc_id, kind)
-                                     )
-                                 """)
-                    conn.execute("CREATE INDEX IF NOT EXISTS idx_indices_kind ON indices(kind)")
-                    conn.commit()
-                except Exception as e:
-                    st.warning(f"Could not ensure `indices` table (DB may be read-only): {e}")
+                    ensure_documents_table(db_path)
+                    cx = open_db(db_path)
 
-                # First try new schema: documents(uri, full_text)
-                # Figure out which columns exist
-                cols_info = pd.read_sql_query("PRAGMA table_info(documents)", conn)
-                doc_cols = set(cols_info["name"].astype(str))
+                    # ------ DB health / global coref status ------
+                    n_trie = count_indices(cx, "trie")
+                    st.caption(f"Global coref indices (trie): {n_trie}")
 
-                # Build a safe SELECT
-                sel_cols = ["doc_id", "uri"]
-                if "created_at" in doc_cols:
-                    sel_cols.append("created_at")
-                else:
-                    sel_cols.append("NULL AS created_at")
-
-                # Prefer stored text_length; fall back to LENGTH(full_text) if present; else NULL
-                if "text_length" in doc_cols:
-                    sel_cols.append("text_length")
-                elif "full_text" in doc_cols:
-                    sel_cols.append("LENGTH(full_text) AS text_length")
-                else:
-                    sel_cols.append("NULL AS text_length")
-
-                df = pd.read_sql_query(
-                    f"SELECT {', '.join(sel_cols)} FROM documents ORDER BY COALESCE(created_at, '') DESC",
-                    conn
-                    )
-   
-                if not df.empty:
-                    st.success(f"Corpus DB ready - {len(df)} documents found")
-                    st.dataframe(df, use_container_width=True)
-                    available_docs = df.to_dict("records")
-                else:
-                    # Fallback: legacy schema spans_file/files (path-only)
-                    st.caption("Using legacy corpus schema (spans_file / files).")
-                    # probe table name
-                    tb = None
-                    for cand in ("spans_file", "files", "documents"):
-                        try:
-                            pd.read_sql_query(f"SELECT 1 FROM {cand} LIMIT 1", conn)
-                            tb = cand
-                            break
-                        except Exception:
-                            pass
-                    if not tb:
-                        st.warning("Could not find legacy file table (spans_file/files).")
-                    else:
-                        # find likely columns
-                        meta = pd.read_sql_query(f"PRAGMA table_info({tb})", conn)
-                        cols = {r["name"] for _, r in meta.iterrows()}
-                        id_col = "id" if "id" in cols else ("rowid" if "rowid" in cols else next(iter(cols)))
-                        path_col = next((c for c in ("path","filepath","filename","name") if c in cols), None)
-                        if not path_col:
-                            st.warning(f"Table {tb} has no path-like column.")
-                        else:
-                            df2 = pd.read_sql_query(
-                                f"SELECT {id_col} AS doc_id, {path_col} AS uri FROM {tb}",
-                                conn
+                    with st.expander("Corpus index / global coref", expanded=(n_trie == 0)):
+                        st.write(
+                            "Initialize or update **global coreference** indices for documents already present in this DB, "
+                            "or build a full corpus from a PDF folder."
+                        )
+                        cA, cB, cC = st.columns([1, 1, 2])
+                        with cA:
+                            max_docs = st.number_input("Max docs (0 = all)", min_value=0, value=0, step=1)
+                        with cB:
+                            enable_cooc = st.checkbox(
+                                "Also build co-occurrence", value=False and HAVE_COOCC,
+                                help="Requires SciPy CSR; enable only if your environment supports it."
                             )
-                            if df2.empty:
-                                st.info("Legacy table is empty.")
+                        with cC:
+                            coref_mode = st.selectbox(
+                                "Coref shortlist mode",
+                                options=["trie", "both", "none"],
+                                index=0,
+                                help="Passed to run_ingestion_quick; 'trie' is sufficient for building the trie grams."
+                            )
+
+                        # ---- Initialize from existing 'documents' table (uses stored URI for each doc) ----
+                        if st.button("Initialize Global Coref (from current DB)"):
+                            # pull doc list
+                            rows = pd.read_sql_query("SELECT doc_id, uri FROM documents ORDER BY doc_id", cx).to_dict("records")
+                            if max_docs and max_docs > 0:
+                                rows = rows[: int(max_docs)]
+
+                                if not rows:
+                                    st.warning("No rows in documents table. Use 'Build / Rebuild corpus from folder' below.")
+                                else:
+                                    total = len(rows)
+                                    prog = st.progress(0.0, text="Starting…")
+                                    done = skipped = errs = 0
+                                    for i, r in enumerate(rows, start=1):
+                                        doc_id = r.get("doc_id")
+                                        uri = _resolve_path(r.get("uri"))
+                                        prog.progress(i / total, text=f"[{i}/{total}] {doc_id}")
+                                        if not uri or not isinstance(uri, str) or not os.path.exists(uri):
+                                            skipped += 1
+                                            st.warning(f"Skipping {doc_id}: missing or non-existent URI: {uri!r}")
+                                            continue
+                                        try:
+                                            res = run_ingestion_quick(
+                                                pdf_path=uri,
+                                                max_sentences=st.session_state["config_ingest"]["max_sentences"],
+                                                max_text_length=st.session_state["config_ingest"]["max_text_length"],
+                                                candidate_source=st.session_state["config_ui"].get("candidate_source", "span"),
+                                                coref_shortlist_mode=coref_mode,
+                                                coref_shortlist_topk=st.session_state["config_coref"]["coref_shortlist_topk"],
+                                                coref_trie_tau=st.session_state["config_coref"]["coref_trie_tau"],
+                                                coref_cooc_tau=st.session_state["config_coref"]["coref_cooc_tau"],
+                                                coref_use_pair_scorer=st.session_state["config_coref"].get("coref_use_pair_scorer", False),
+                                                coref_scorer_threshold=st.session_state["config_coref"].get("coref_scorer_threshold", 0.25),
+                                            )
+                                            prod = res.get("production_output") or res
+                                            # export rows
+                                            export_production_to_flexiconc(db_path, doc_id, prod, uri=uri)
+                                            # trie
+                                            chains = (prod.get("coreference_analysis") or {}).get("chains") or []
+                                            if chains:
+                                                trie_root, trie_idf, chain_grams = build_ngram_trie(chains, char_n=4, token_ns=(2, 3))
+                                                upsert_doc_trie(cx, doc_id, trie_root, trie_idf, chain_grams)
+                                                done += 1
+                                            else:
+                                                skipped += 1
+                                                st.info(f"No chains in analysis for {doc_id}; trie not written.")
+                                                # optional co-occ
+                                                if enable_cooc and HAVE_COOCC:
+                                                    try:
+                                                        full_text = prod.get("full_text") or ""
+                                                        if full_text:
+                                                            _ = full_text  # placeholder if you later upsert co-occ
+                                                            vocab, rows, norms = build_cooc_graph(full_text, window=5, min_count=2, topk_neighbors=10)
+                                                            upsert_doc_cooc(cx, doc_id, vocab, rows, norms)
+                                                    except Exception as coe:
+                                                        st.warning(f"Co-occ build failed for {doc_id}: {coe}")
+                                        except Exception as e:
+                                            errs += 1
+                                            st.exception(e)
+                                    n_now = count_indices(cx, "trie")
+                                    st.success(
+                                        f"Global coref init complete. "
+                                        f"Trie written for {done} doc(s), skipped {skipped}, errors {errs}. "
+                                        f"indices(kind='trie') now: {n_now}"
+                                    )
+                                    try:
+                                        st.caption(f"Sample payload sizes: {list_index_sizes(cx, 'trie', limit=3)}")
+                                    except Exception:
+                                        pass
+
+                            # ---- Build / Rebuild corpus from a PDF folder (full production) ----
+                            pdf_dir = st.text_input("PDF folder (for full corpus build)", value=source_root)
+                            if st.button("Build / Rebuild corpus from folder") and pdf_dir:
+                                from pathlib import Path as _Path
+                                pdfs = list(_Path(pdf_dir).rglob("*.pdf"))
+                                if not pdfs:
+                                    st.warning("No PDFs found in that folder.")
+                                else:
+                                    total = len(pdfs)
+                                    prog = st.progress(0.0, text="Starting…")
+                                    done = errs = 0
+                                    for i, path in enumerate(pdfs, start=1):
+                                        doc_id = _Path(path).stem
+                                        prog.progress(i / total, text=f"[{i}/{total}] {doc_id}")
+                                        try:
+                                            res = run_ingestion_quick(
+                                                pdf_path=str(path),
+                                                max_sentences=st.session_state["config_ingest"]["max_sentences"],
+                                                max_text_length=st.session_state["config_ingest"]["max_text_length"],
+                                                candidate_source=st.session_state["config_ui"].get("candidate_source", "span"),
+                                                coref_shortlist_mode=coref_mode,
+                                                coref_shortlist_topk=st.session_state["config_coref"]["coref_shortlist_topk"],
+                                                coref_trie_tau=st.session_state["config_coref"]["coref_trie_tau"],
+                                                coref_cooc_tau=st.session_state["config_coref"]["coref_cooc_tau"],
+                                                coref_use_pair_scorer=st.session_state["config_coref"].get("coref_use_pair_scorer", False),
+                                                coref_scorer_threshold=st.session_state["config_coref"].get("coref_scorer_threshold", 0.25),
+                                            )
+                                            prod = res.get("production_output") or res
+                                            export_production_to_flexiconc(db_path, doc_id, prod, uri=str(path))
+                                            chains = (prod.get("coreference_analysis") or {}).get("chains") or []
+                                            if chains:
+                                                trie_root, trie_idf, chain_grams = build_ngram_trie(chains, char_n=4, token_ns=(2, 3))
+                                                upsert_doc_trie(cx, doc_id, trie_root, trie_idf, chain_grams)
+                                                done += 1
+                                        except Exception as e:
+                                            errs += 1
+                                            st.exception(e)
+                                    n_now = count_indices(cx, "trie")
+                                    st.success(f"Rebuild complete. Trie rows now: {n_now}. Built OK={done}, errors={errs}.")
+                                    try:
+                                        st.caption(f"Sample payload sizes: {list_index_sizes(cx, 'trie', limit=3)}")
+                                    except Exception:
+                                        pass
+
+                        # ------ Load corpus rows (documents table preferred; legacy fallback) ------
+                        try:
+                            # Inspect documents schema
+                            cols_info = pd.read_sql_query("PRAGMA table_info(documents)", cx)
+                            doc_cols = set(cols_info["name"].astype(str))
+
+                            sel_cols = ["doc_id", "uri"]
+                            sel_cols.append("created_at" if "created_at" in doc_cols else "NULL AS created_at")
+                            if "text_length" in doc_cols:
+                                sel_cols.append("text_length")
+                            elif "full_text" in doc_cols:
+                                sel_cols.append("LENGTH(full_text) AS text_length")
                             else:
-                                # resolve relative paths using source_root (if set)
-                                df2["uri"] = df2["uri"].apply(_resolve_path)
-                                df2["created_at"] = None
-                                df2["text_length"] = None
-                                st.success(f"Found {len(df2)} file entries in {tb}.")
-                                df2["created_at"] = None
-                                df2["text_length"] = None
-                                show_cols = [c for c in df2.columns if not (c in ("created_at","text_length") and df2[c].isna().all())]
-                                st.dataframe(df2[show_cols], use_container_width=True)
-                                available_docs = df2.to_dict("records")
-            except Exception as e:
-                st.error(f"Error accessing corpus: {e}")
-            finally:
-                if conn is not None:
-                    conn.close()
+                                sel_cols.append("NULL AS text_length")
+                                
+                            df = pd.read_sql_query(
+                                f"SELECT {', '.join(sel_cols)} FROM documents ORDER BY COALESCE(created_at, '') DESC",
+                                    cx
+                            )
+                            if not df.empty:
+                                st.success(f"Corpus DB ready - {len(df)} documents found")
+                                st.dataframe(df, use_container_width=True)
+                                available_docs = df.to_dict("records")
+                            else:
+                                # Legacy fallback
+                                st.caption("Using legacy corpus schema (spans_file / files).")
+                                tb = None
+                                for cand in ("spans_file", "files", "documents"):
+                                    try:
+                                        pd.read_sql_query(f"SELECT 1 FROM {cand} LIMIT 1", cx)
+                                        tb = cand
+                                        break
+                                    except Exception:
+                                        pass
+                                    if not tb:
+                                        st.warning("Could not find legacy file table (spans_file/files).")
+                                    else:
+                                        meta = pd.read_sql_query(f"PRAGMA table_info({tb})", cx)
+                                        cols = {r["name"] for _, r in meta.iterrows()}
+                                        id_col = "id" if "id" in cols else ("rowid" if "rowid" in cols else next(iter(cols)))
+                                        path_col = next((c for c in ("path","filepath","filename","name") if c in cols), None)
+                                        if not path_col:
+                                            st.warning(f"Table {tb} has no path-like column.")
+                                        else:
+                                            df2 = pd.read_sql_query(
+                                                f"SELECT {id_col} AS doc_id, {path_col} AS uri FROM {tb}",
+                                                cx
+                                            )
+                                            if df2.empty:
+                                                st.info("Legacy table is empty.")
+                                            else:
+                                                df2["uri"] = df2["uri"].apply(_resolve_path)
+                                                df2["created_at"] = None
+                                                df2["text_length"] = None
+                                                st.success(f"Found {len(df2)} file entries in {tb}.")
+                                                show_cols = [
+                                                    c for c in df2.columns
+                                                    if not (c in ("created_at","text_length") and df2[c].isna().all())
+                                                ]
+                                                st.dataframe(df2[show_cols], use_container_width=True)
+                                                available_docs = df2.to_dict("records")
+                        except Exception as e:
+                            st.error(f"Error accessing corpus: {e}")
+                        finally:
+                            if cx is not None:
+                                cx.close()
 
         st.session_state["available_docs"] = available_docs
 
@@ -541,35 +672,35 @@ with st.container(border=True):
                 selected_doc_id = available_docs[selected_idx]["doc_id"]
                 st.session_state["selected_doc_id"] = selected_doc_id
                 st.info(f"Selected: {selected_doc_id}")
+                
+                # Actions: load saved vs fresh analysis
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                load_btn = st.button("Load Document Analysis (from DB)")
+            with c2:
+                fresh_btn = st.button("Analyze selected (fresh)")
 
-        # Actions: load saved vs fresh analysis
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            load_btn = st.button("Load Document Analysis (from DB)")
-        with c2:
-            fresh_btn = st.button("Analyze selected (fresh)")
+            # Load saved (FlexiConc) analysis if present
+            if load_btn and selected_doc_id is not None:
+                try:
+                    from flexiconc_adapter import load_production_from_flexiconc
+                    with st.spinner("Loading saved analysis from DB..."):
+                        loaded_production = load_production_from_flexiconc(db_path, selected_doc_id)
+                        if loaded_production and loaded_production.get("sentence_analyses"):
+                            st.session_state["results"] = {"production_output": loaded_production}
+                            st.session_state["current_doc_rows"] = None
+                            st.success(f"Loaded analysis for {selected_doc_id} - {len(loaded_production['sentence_analyses'])} sentences")
+                        else:
+                            st.error("No analysis found for selected document")
+                        except Exception as e:
+                            st.error(f"Failed to load document: {e}")
 
-        # Load saved (FlexiConc) analysis if present
-        if load_btn and selected_doc_id is not None:
-            try:
-                from flexiconc_adapter import load_production_from_flexiconc
-                with st.spinner("Loading saved analysis from DB..."):
-                    loaded_production = load_production_from_flexiconc(db_path, selected_doc_id)
-                    if loaded_production and loaded_production.get("sentence_analyses"):
-                        st.session_state["results"] = {"production_output": loaded_production}
-                        st.session_state["current_doc_rows"] = None
-                        st.success(f"Loaded analysis for {selected_doc_id} - {len(loaded_production['sentence_analyses'])} sentences")
-                    else:
-                        st.error("No analysis found for selected document")
-            except Exception as e:
-                st.error(f"Failed to load document: {e}")
-
-        # FRESH in-memory analysis on the selected row's URI (no FlexiConc I/O)
-        if fresh_btn and selected_doc_id is not None:
-            if not available_docs:
-                st.warning("No corpus rows loaded.")
-            else:
-                row = next((r for r in available_docs if r["doc_id"] == selected_doc_id), None)
+            # FRESH in-memory analysis on the selected row's URI (no FlexiConc I/O)
+            if fresh_btn and selected_doc_id is not None:
+                if not available_docs:
+                    st.warning("No corpus rows loaded.")
+                else:
+                    row = next((r for r in available_docs if r["doc_id"] == selected_doc_id), None)
                 if not row:
                     st.warning("Could not resolve selected document row.")
                 else:
@@ -578,7 +709,7 @@ with st.container(border=True):
                         st.warning("Selected row has no uri/path.")
                     else:
                         with st.spinner(f"Analyzing file (fresh): {uri}"):
-                            try:                                
+                            try:
                                 cfg_ing  = st.session_state["config_ingest"]
                                 cfg_ui   = st.session_state["config_ui"]
                                 cfg_coref = st.session_state["config_coref"]
@@ -593,8 +724,7 @@ with st.container(border=True):
                                     coref_cooc_tau=cfg_coref["coref_cooc_tau"],
                                     coref_use_pair_scorer=cfg_coref.get("coref_use_pair_scorer", False),
                                     coref_scorer_threshold=cfg_coref.get("coref_scorer_threshold", 0.25),
-                                    )   
-                                
+                                )
                                 # attach uri for display; cache rows for single-doc concordance
                                 res = dict(res or {})
                                 res["document_uri"] = uri
@@ -608,8 +738,41 @@ with st.container(border=True):
                                     st.success(f"✅ Fresh analysis complete. {n} sentences available.")
                                 else:
                                     st.error(f"❌ Analysis failed or empty. {res.get('error','')}")
-                            except Exception as e:
-                                st.exception(e)
+                                except Exception as e:
+                                    st.exception(e)
+
+        # --- Optional: Update corpus with this fresh analysis (explicit actions) ---
+        if "results" in st.session_state and st.session_state.get("results"):
+            prod = _get_production_output(st.session_state["results"])
+            if prod:
+                c3, c4 = st.columns([1, 1])
+                with c3:
+                    if st.button("💾 Save this analysis to corpus"):
+                        try:
+                            from flexiconc_adapter import export_production_to_flexiconc
+                            export_production_to_flexiconc(db_path, selected_doc_id, prod, uri=uri)
+                            st.success("Saved into documents/sentences/chains.")
+                        except Exception as e:
+                            st.error(f"Save failed: {e}")
+                with c4:
+                    if st.button("📇 Upsert global coref (this doc)"):
+                        try:
+                            from flexiconc_adapter import open_db, upsert_doc_trie, count_indices, list_index_sizes
+                            from helper_addons import build_ngram_trie
+                            chains = (prod.get("coreference_analysis") or {}).get("chains") or []
+                            if not chains:
+                                st.warning("No coreference chains found in this analysis.")
+                            else:
+                                cx2 = open_db(db_path)
+                                trie_root, trie_idf, chain_grams = build_ngram_trie(chains, char_n=4, token_ns=(2, 3))
+                                upsert_doc_trie(cx2, selected_doc_id, trie_root, trie_idf, chain_grams)
+                                n_now = count_indices(cx2, "trie")
+                                st.success(f"Trie payload upserted. indices(kind='trie') now: {n_now}")
+                                try:
+                                    st.caption(f"Sample payload sizes: {list_index_sizes(cx2, 'trie', limit=3)}")
+                                except Exception:
+                                    pass
+                                cx2.close()
 
 # -------------------- Step 2: Sentence & Keyword/Span Selection --------------------
 with st.container(border=True):
