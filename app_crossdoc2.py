@@ -7,7 +7,12 @@ import re
 import os
 from pathlib import Path
 import streamlit as st
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
+
+try:
+    import torch
+except Exception:  # pragma: no cover - torch may be unavailable in some envs
+    torch = None
 
 # Local helpers / configs
 from ui_config import (
@@ -82,6 +87,54 @@ def _init_state():
     ss.setdefault("filter_local_coref", False)
     ss.setdefault("local_chain_grams", None)
 _init_state()
+
+def _available_coref_devices() -> List[str]:
+    """Return the set of supported coref devices in preferred order."""
+    options = ["cpu"]
+    if torch is not None:
+        try:
+            if torch.cuda.is_available():
+                count = torch.cuda.device_count() or 1
+                options.extend([f"cuda:{i}" for i in range(count)])
+        except Exception:
+            pass
+    return options
+
+
+def _default_coref_device() -> str:
+    opts = _available_coref_devices()
+    for opt in opts:
+        if opt.startswith("cuda"):
+            return opt
+    return opts[0]
+
+
+def _normalize_coref_device(device_val: Optional[str]) -> str:
+    """Normalize UI-provided device strings to supported values."""
+    requested = (device_val or "").strip()
+    opts = _available_coref_devices()
+    default = _default_coref_device()
+    if not requested:
+        return default
+    lowered = requested.lower()
+    if lowered in {"auto", "default", ""}:
+        return default
+    if lowered == "cuda":
+        # normalize bare cuda to the first GPU option
+        return default if default.startswith("cuda") else "cpu"
+    for opt in opts:
+        if lowered == opt.lower():
+            return opt
+    if lowered.startswith("cuda:") and any(opt.startswith("cuda") for opt in opts):
+        return default
+    return default
+
+
+def _ensure_coref_device(cfg_coref: Dict[str, Any]) -> str:
+    """Ensure the config dict carries a supported device string."""
+    norm = _normalize_coref_device(cfg_coref.get("device"))
+    cfg_coref["device"] = norm
+    return norm
 
 def _get_production_output(obj):
     """
@@ -587,7 +640,7 @@ with st.sidebar:
                     max_text_length=cfg_ing["max_text_length"],
                     candidate_source=cfg_ui.get("candidate_source", "span"),
                     coref_backend=cfg_coref.get("engine", "fastcoref"),
-                    coref_device=cfg_coref.get("device"),
+                    coref_device = _ensure_coref_device(cfg_coref),
                     coref_scope=cfg_coref.get("scope"),
                     coref_window_sentences=cfg_coref.get("window_sentences"),
                     coref_window_stride=cfg_coref.get("window_stride"),
@@ -813,7 +866,7 @@ with st.container(border=True):
                     # Add the candidate source selection
                     candidate_source=st.session_state["config_ui"]["candidate_source"],
                     coref_backend=cfg_coref.get("engine", "fastcoref"),
-                    coref_device=cfg_coref.get("device"),
+                    coref_device = _ensure_coref_device(cfg_coref),
                     coref_scope=cfg_coref.get("scope"),
                     coref_window_sentences=cfg_coref.get("window_sentences"),
                     coref_window_stride=cfg_coref.get("window_stride"),
@@ -936,7 +989,7 @@ with st.container(border=True):
                                         candidate_source=st.session_state["config_ui"].get("candidate_source", "span"),
                                         # coref backend / device / resolved text
                                         coref_backend=cfg_coref.get("engine", "fastcoref"),
-                                        coref_device=cfg_coref.get("device", "cpu"),
+                                        coref_device = _ensure_coref_device(cfg_coref),
                                         resolve_text=cfg_coref.get("resolve_text", True),
                                         coref_scope=cfg_coref.get("scope"),
                                         coref_window_sentences=cfg_coref.get("window_sentences"),
@@ -1030,7 +1083,7 @@ with st.container(border=True):
                                         max_text_length=st.session_state["config_ingest"]["max_text_length"],
                                         candidate_source=st.session_state["config_ui"].get("candidate_source", "span"),
                                         coref_backend=cfg_coref.get("engine", "fastcoref"),
-                                        coref_device=cfg_coref.get("device", "cpu"),
+                                        coref_device = _ensure_coref_device(cfg_coref),
                                         resolve_text=cfg_coref.get("resolve_text", True),
                                         coref_shortlist_mode=coref_mode,
                                         coref_scope=cfg_coref.get("scope"),
@@ -1233,7 +1286,7 @@ with st.container(border=True):
                                         max_sentences=cfg_ing["max_sentences"],
                                         max_text_length=cfg_ing["max_text_length"],
                                         coref_backend=cfg_coref.get("engine", "fastcoref"),
-                                        coref_device=cfg_coref.get("device"),
+                                        coref_device = _ensure_coref_device(cfg_coref),
                                         coref_scope=cfg_coref.get("scope"),
                                         coref_window_sentences=cfg_coref.get("window_sentences"),
                                         coref_window_stride=cfg_coref.get("window_stride"),

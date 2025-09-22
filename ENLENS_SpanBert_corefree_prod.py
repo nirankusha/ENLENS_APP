@@ -43,6 +43,42 @@ from global_coref_helper import (
 from span_chains import _map_span_to_chain, _build_chain_trees
 from lingmess_coref import ensure_fastcoref_component, make_lingmess_nlp, run_lingmess_coref
 
+try:
+    import torch
+except Exception:  # pragma: no cover - torch may be unavailable in some envs
+    torch = None
+
+def _available_devices() -> List[str]:
+    devices = ["cpu"]
+    if torch is not None:
+        try:
+            if torch.cuda.is_available():
+                count = torch.cuda.device_count() or 1
+                devices.extend([f"cuda:{i}" for i in range(count)])
+        except Exception:
+            pass
+    return devices
+
+
+def _normalize_device(requested: Optional[str]) -> str:
+    opts = _available_devices()
+    default = next((opt for opt in opts if opt.startswith("cuda")), opts[0])
+    if requested is None:
+        return default
+    value = str(requested).strip()
+    if not value or value.lower() in {"auto", "default"}:
+        return default
+    lowered = value.lower()
+    if lowered == "cuda":
+        return default if default.startswith("cuda") else "cpu"
+    for opt in opts:
+        if lowered == opt.lower():
+            return opt
+    if lowered.startswith("cuda:") and any(opt.startswith("cuda") for opt in opts):
+        return default
+    return default
+
+
 # ---------- main ----------
 def _classify_dual(sentence: str, 
                    agree_threshold: float = 0.1,
@@ -108,7 +144,7 @@ def run_quick_analysis(
             # Use helper for robust parsing + edges
             ensure_fastcoref_component()
             
-            coref_device = kwargs.get("coref_device", "cpu")
+            coref_device = _normalize_device(kwargs.get("coref_device"))
             want_resolved = bool(kwargs.get("resolve_text", True))
 
             nlp, resolver = make_lingmess_nlp(device=coref_device, eager_attention=True)
