@@ -16,7 +16,8 @@ Highlights:
 from __future__ import annotations
 from typing import List, Dict, Any, Tuple, Optional, Literal
 import json
-
+import re
+ 
 import ipywidgets as widgets
 from IPython.display import display, HTML, clear_output
 
@@ -36,7 +37,7 @@ from helper_addons import (
 
 # your existing KPE extractor
 from spanbert_kp_extractor import BertKpeExtractor
-
+from ENLENS_SpanBert_corefree_prod import attach_chain_edge_tags
 from ui_common import build_sentence_options, render_sentence_overlay
 
 # ---------- chain helpers ----------
@@ -115,6 +116,7 @@ def run_quick_analysis(pdf_file: str, max_sentences: int = 30, top_k_phrases: in
 
     coref = analyze_full_text_coreferences(full_text) or {}
     chains = normalize_chain_mentions(coref.get("chains", []) or [])
+    attach_chain_edge_tags(chains)
     chain_trees = _build_chain_trees(chains)
 
     sentences = extract_and_filter_sentences(full_text)

@@ -126,13 +126,15 @@ def run_ingestion_quick(
     coref_scope: str | None = None,            # 'whole_document' | 'windowed'
     coref_window_sentences: int | None = None,
     coref_window_stride: int | None = None,
-    coref_backend: str | None = None,       
-    coref_device: str | None = None,        
-    resolve_text: bool | None = None,       
-    # sdg / consensus (if exposed)
+    coref_backend: str | None = None,
+    coref_device: str | None = None,
+    resolve_text: bool | None = None,# sdg / consensus (if exposed)
     agree_threshold: float | None = None,
     disagree_threshold: float | None = None,
     min_confidence: float | None = None,
+    #co-occurance knobs
+    cooc_mode: str | None = None,
+    cooc_hf_tokenizer: Any | None = None,
     # anything else the pipeline might take in the future
     **extra
 ):
@@ -142,7 +144,12 @@ def run_ingestion_quick(
     pdf_path = str(pdf_path)
     if not Path(pdf_path).exists():
         return {"ok": False, "error": f"file not found: {pdf_path}"}
-        
+    legacy_mode = extra.pop("cooc_mode", None)
+    legacy_tok = extra.pop("cooc_hf_tokenizer", None)
+    if cooc_mode is None:
+        cooc_mode = legacy_mode
+    if cooc_hf_tokenizer is None:
+        cooc_hf_tokenizer = legacy_tok    
     # Select the appropriate pipeline function
     if candidate_source == "kp" and _run_quick_kpe is not None:
         pipeline_fn = _run_quick_kpe
@@ -244,12 +251,30 @@ def run_ingestion_quick(
                     char_n=4,
                     token_ns=(2, 3),
                 )
+                effective_mode = (cooc_mode or "spacy").lower()
+                effective_tokenizer = cooc_hf_tokenizer
+                fallback_msg = None
+                if effective_mode == "hf" and effective_tokenizer is None:
+                    fallback_msg = (
+                        "cooc_mode='hf' requested but no tokenizer supplied; falling back to spaCy for co-occurrence export."
+                    )
+                    effective_mode = "spacy"
+                    logger.warning(fallback_msg)
+                    if isinstance(result, dict):
+                        result.setdefault("_warn", []).append(fallback_msg)
+                cooc_window = extra.get("cooc_window", 5)
+                cooc_min_count = extra.get("cooc_min_count", 2)
+                cooc_topk = extra.get("cooc_topk_neighbors", 10)
+                if effective_mode != "hf":
+                    effective_tokenizer = None
                 vocab, rows, row_norms = build_cooc_graph(
                     prod["full_text"],
-                    window=5,
-                    min_count=2,
-                    topk_neighbors=10,
-                )
+                    window=cooc_window,
+                    min_count=cooc_min_count,
+                    topk_neighbors=cooc_topk,
+                    mode=effective_mode,
+                    hf_tokenizer=effective_tokenizer,
+                    )
                 upsert_doc_trie(cx, doc_id, trie_root, trie_idf, chain_grams)
                 upsert_doc_cooc(cx, doc_id, vocab, rows, row_norms)
             finally:

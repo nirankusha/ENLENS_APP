@@ -57,9 +57,11 @@ COREF_CONFIG = {
     "link_prune_threshold": 0.40,
     "attach_to_spans": True,
     "coref_shortlist_mode": "trie",   # "off" | "trie" | "cooc" | "both"
-    "coref_shortlist_topk": 50,       
-    "coref_trie_tau": 0.18,           
-    "coref_cooc_tau": 0.18,           
+    "coref_shortlist_topk": 50,
+    "coref_trie_tau": 0.18,
+    "coref_cooc_tau": 0.18,
+    "cooc_mode": "spacy",              # "spacy" | "hf"
+    "cooc_hf_tokenizer": "",           
     "coref_use_pair_scorer": False,
     "coref_scorer_threshold": 0.25,
 }

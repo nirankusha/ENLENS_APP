@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 # Color / ordinal helpers
 # =========================
 def rgb_to_signed_score(rgb_hex: str | None) -> float:
-    """Green → positive, Red → negative, magnitude = s*v (0..1)."""
+    """Green → +, Red → −, magnitude = s*v (0..1)."""
     if not rgb_hex:
         return 0.0
     if len(rgb_hex) == 8:  # 'FFRRGGBB' -> 'RRGGBB'
@@ -36,7 +36,6 @@ def rgb_to_signed_score(rgb_hex: str | None) -> float:
     return 0.0                  # neutral/other hues
 
 def signed_score_to_likert(score: float, n_levels: int = 5) -> int:
-    """Map continuous signed score to integer ±1..±n_levels, 0 for neutral."""
     if score == 0:
         return 0
     a = min(abs(score), 1.0)
@@ -44,14 +43,13 @@ def signed_score_to_likert(score: float, n_levels: int = 5) -> int:
     return lvl if score > 0 else -lvl
 
 def theme_to_rgb(theme_index: int | None, theme_map: Dict[int, str] | None = None) -> str | None:
-    """Map theme indices to RGB; extend as needed for your workbook."""
-    base = {9: 'FF00FF00', 10: 'FFFF0000'}  # green, red
+    base = {9: 'FF00FF00', 10: 'FFFF0000'}  # extend for your workbook if needed
     if theme_map:
         base.update(theme_map)
     return base.get(theme_index, None)
 
 # =========================
-# XLSX -> MultiIndex DataFrame with likert
+# XLSX -> MultiIndex DataFrame (values + likert)
 # =========================
 def extract_third_sheet_multiheader_and_urls(
     xlsx_path: str,
@@ -59,16 +57,12 @@ def extract_third_sheet_multiheader_and_urls(
     n_levels: int = 5,
     theme_override: Dict[int, str] | None = None
 ) -> pd.DataFrame:
-    """
-    Extract sheet #3, build MultiIndex header, keep values and likert as separate columns,
-    and add URL helper columns ('URLs', 'first_url' / 'all_urls').
-    """
     wb = load_workbook(xlsx_path, data_only=True)
     ws = wb.worksheets[2]
 
     rows = []
     for row in ws.iter_rows(values_only=False):
-        row_vals, row_likerts = [], []
+        vals, likes = [], []
         for cell in row:
             val = cell.value
             score = 0.0
@@ -82,14 +76,13 @@ def extract_third_sheet_multiheader_and_urls(
                         rgb = theme_to_rgb(fill.fgColor.theme, theme_override)
                         score = rgb_to_signed_score(rgb)
                     elif fgtype == 'indexed':
-                        # If you need indexed-color mapping, extend here.
                         score = 0.0
                 except Exception:
                     pass
             lik = signed_score_to_likert(score, n_levels=n_levels)
-            row_vals.append(val)
-            row_likerts.append(lik)
-        rows.append((row_vals, row_likerts))
+            vals.append(val)
+            likes.append(lik)
+        rows.append((vals, likes))
 
     df_values = pd.DataFrame([r[0] for r in rows])
     df_likert = pd.DataFrame([r[1] for r in rows])
@@ -115,15 +108,23 @@ def extract_third_sheet_multiheader_and_urls(
     df_values.columns = cols
     df_likert.columns = pd.MultiIndex.from_tuples([(L1, f"{L2}__likert") for (L1, L2) in tuples])
 
-    # Drop header rows
+    # drop header rows
     df_values = df_values.drop(index=range(0, i2+1)).reset_index(drop=True)
     df_likert = df_likert.drop(index=range(0, i2+1)).reset_index(drop=True)
 
-    # Combine values + likert
+    # combine values + likert
     df = pd.concat([df_values, df_likert], axis=1)
 
+    # strip '|<int>' suffix from BOTH header levels (if headers were annotated)
+    def _strip_header_likert(s: str) -> str:
+        return re.sub(r"\|[-+]?\d+$", "", str(s))
+    df.columns = pd.MultiIndex.from_tuples([
+        (_strip_header_likert(L1), _strip_header_likert(L2))
+        for (L1, L2) in df.columns
+    ])
+
     # --- URL extraction (robust across L1 groups) ---
-    df = df.sort_index(axis=1)  # keep lexsort invariant
+    df = df.sort_index(axis=1)  # keep lexsorted to avoid warnings
     lvl2_all = df.columns.get_level_values(1)
     ref_l2 = [c for c in lvl2_all if c is not None and re.search(r'\breference\b', str(c), re.I)]
     if ref_l2:
@@ -145,13 +146,12 @@ def extract_third_sheet_multiheader_and_urls(
     return df
 
 # =========================
-# Flatten + fuzzy select + split "value|likert" if present (backup)
+# Flatten (fuzzy) + split "value|likert" if present
 # =========================
-def _split_value_likert(s):
-    """If a cell was 'value|k', return (value, k). Otherwise (value, None)."""
-    if s is None or (isinstance(s, float) and pd.isna(s)):
+def _split_value_likert(x):
+    if x is None or (isinstance(x, float) and pd.isna(x)):
         return (None, None)
-    s = str(s)
+    s = str(x)
     m = re.match(r"^(.*?)(?:\|(-?\d+))?$", s)
     if not m:
         return (s, None)
@@ -161,28 +161,40 @@ def _split_value_likert(s):
 
 def flatten_df(df):
     """
-    Flatten to single-level columns and select logical fields with fuzzy matching.
-    Assumes extractor created parallel __likert columns already, but also
-    supports splitting 'value|k' in case inputs were annotated elsewhere.
+    Flatten to single-level columns and select logical fields robustly.
+    - Prefer true value columns (exclude __likert).
+    - Prefer true __likert columns for likert.
+    - Split 'value|k' defensively if strings were annotated upstream.
     """
     df = df.copy()
+    # 1) Flatten MultiIndex → "L1|L2"
     df.columns = ["|".join([str(c) for c in col if c not in (None, "")])
                   for col in df.columns.to_flat_index()]
 
-    # Fuzzy matching helpers
-    def norm(s): return re.sub(r"\s+", " ", str(s)).strip().lower()
-    norm_map = {c: norm(c) for c in df.columns}
+    # 2) Normalization + helpers
+    def norm(s): 
+        return re.sub(r"\s+", " ", str(s)).strip().lower()
 
-    def find_candidates(*pats):
+    norm_map = {orig: norm(orig) for orig in df.columns}
+
+    def find_candidates(*regexes, include_likert=True, exclude_likert=False):
+        """Return original column names matching any regex (on normalized name)."""
         out = []
         for orig, n in norm_map.items():
-            for p in pats:
-                if re.search(p, n, flags=re.I):
-                    out.append(orig); break
+            if exclude_likert and n.endswith("__likert"):
+                continue
+            if not include_likert and n.endswith("__likert"):
+                continue
+            for pat in regexes:
+                if re.search(pat, n, flags=re.I):
+                    out.append(orig)
+                    break
         return out
 
     def pick_best(cols):
-        if not cols: return None
+        """Pick the column with the most non-empty cells."""
+        if not cols:
+            return None
         scored = []
         for c in cols:
             s = df[c]
@@ -191,75 +203,134 @@ def flatten_df(df):
         scored.sort(reverse=True)
         return scored[0][1]
 
-    # What to pull (adjust patterns if your workbook shifts)
-    choices = {
-        "Goal":   pick_best(find_candidates(r"\binput data\|goal\b", r"^goal\b")),
-        "Target": pick_best(find_candidates(r"\binput data\|target\b", r"^target\b")),
-        "Target description": pick_best(find_candidates(r"\binput data\|target description\b", r"target desc")),
-        "Dimension of Temporality": pick_best(find_candidates(r"dimension of temporality")),
-        "Reciprocal Interdependence": pick_best(find_candidates(r"reciprocal interdependence")),
-        "Justification": pick_best(find_candidates(r"\bjustification\b")),
-        "Reference":     pick_best(find_candidates(r"\breference\b", r"\brefs?\b")),
-    }
+    # 3) VALUE columns (explicitly EXCLUDE __likert)
+    goal_col   = pick_best(find_candidates(
+        r"(^|\|)input data\|goal$", r"(^|\|)goal$", exclude_likert=True))
+    target_col = pick_best(find_candidates(
+        r"(^|\|)input data\|target$", r"(^|\|)target$", exclude_likert=True))
+    tdesc_col  = pick_best(find_candidates(
+        r"(^|\|)input data\|target description$", r"(^|\|)target\s*description$",
+        r"(^|\|)target\s*desc", exclude_likert=True))
+    temp_col   = pick_best(find_candidates(
+        r"(^|\|)input data\|dimension[s]?\s*of\s*temporality$",
+        r"(^|\|)dimension[s]?\s*of\s*temporality$", r"temporality", exclude_likert=True))
+    recip_col  = pick_best(find_candidates(
+        r"(^|\|)input data\|reciprocal\s*interdependence$",
+        r"(^|\|)reciprocal\s*interdependence$", exclude_likert=True))
+    just_col   = pick_best(find_candidates(
+        r"(^|\|)green hydrogen value chain justification\|.*\|justification$",
+        r"(^|\|)justification$", exclude_likert=True))
+    ref_col    = pick_best(find_candidates(
+        r"(^|\|)green hydrogen value chain justification\|.*\|reference$",
+        r"(^|\|)reference$", r"(^|\|)refs?$", exclude_likert=True))
 
-    out = pd.DataFrame({k: (df[v] if v and v in df.columns else pd.Series([None]*len(df)))
-                        for k, v in choices.items()})
+    # 4) LIKERT columns (ONLY look for __likert)
+    t_like     = pick_best(find_candidates(r"(^|\|)target__likert$", include_likert=True))
+    tdesc_like = pick_best(find_candidates(r"(^|\|)target description__likert$", include_likert=True))
+    temp_like  = pick_best(find_candidates(r"(^|\|)dimension[s]?\s*of\s*temporality__likert$", include_likert=True))
+    recip_like = pick_best(find_candidates(r"(^|\|)reciprocal\s*interdependence__likert$", include_likert=True))
+    just_like  = pick_best(find_candidates(r"(^|\|)justification__likert$", include_likert=True))
+    ref_like   = pick_best(find_candidates(r"(^|\|)reference__likert$", include_likert=True))
 
-    # Forward fill Goal
-    if "Goal" in out:
-        out["Goal"] = out["Goal"].replace(r"^\s*$", None, regex=True).ffill()
+    # 5) Build output frame
+    def sget(col):
+        return df[col] if col and col in df.columns else pd.Series([None]*len(df), index=df.index)
 
-    # Split 'value|likert' if it appears (defensive)
+    out = pd.DataFrame({
+        "Goal":                       sget(goal_col),
+        "Target":                     sget(target_col),
+        "Target description":         sget(tdesc_col),
+        "Dimension of Temporality":   sget(temp_col),
+        "Reciprocal Interdependence": sget(recip_col),
+        "Justification":              sget(just_col),
+        "Reference":                  sget(ref_col),
+    })
+
+    # 6) Forward-fill Goal
+    out["Goal"] = out["Goal"].replace(r"^\s*$", None, regex=True).ffill()
+
+    # 7) Split "value|likert" defensively (in case the body strings were annotated)
+    def _split_value_likert(x):
+        if x is None or (isinstance(x, float) and pd.isna(x)): return (None, None)
+        s = str(x)
+        m = re.match(r"^(.*?)(?:\|(-?\d+))?$", s)
+        if not m: return (s if s.strip() else None, None)
+        val = (m.group(1) or "").strip()
+        lk  = m.group(2)
+        return (val if val else None, (int(lk) if lk is not None else None))
+
     for k in ["Target", "Target description", "Dimension of Temporality",
               "Reciprocal Interdependence", "Justification", "Reference"]:
-        if k in out:
-            pairs = out[k].apply(_split_value_likert)
-            # only overwrite likert column if we DON'T already have extractor-made one
-            if f"{k}__likert" not in df.columns:
-                out[f"{k}__likert"] = pairs.apply(lambda t: t[1])
-            # always set clean text value
-            out[k] = pairs.apply(lambda t: t[0]) if pairs.notna().any() else out[k]
+        pairs = out[k].apply(_split_value_likert)
+        # set clean value text
+        out[k] = pairs.apply(lambda t: t[0])
 
-        # if extractor produced "{k}__likert" at source level, try to bring it in
-        src_like = pick_best(find_candidates(fr"{re.escape(k)}__likert$"))
-        if src_like and src_like in df.columns:
-            out[f"{k}__likert"] = df[src_like]
+    # 8) Attach likert from extractor-made __likert if present, else from split
+    if t_like     and t_like     in df.columns: out["Target__likert"]                     = df[t_like]
+    else:                                         out["Target__likert"]                     = out["Target"].apply(lambda _: None)
 
-    # Keep rows with any meaningful payload
+    if tdesc_like and tdesc_like in df.columns: out["Target description__likert"]         = df[tdesc_like]
+    else:                                         out["Target description__likert"]         = out["Target description"].apply(lambda _: None)
+
+    if temp_like  and temp_like  in df.columns: out["Dimension of Temporality__likert"]   = df[temp_like]
+    else:                                         out["Dimension of Temporality__likert"]   = out["Dimension of Temporality"].apply(lambda _: None)
+
+    if recip_like and recip_like in df.columns: out["Reciprocal Interdependence__likert"] = df[recip_like]
+    else:                                         out["Reciprocal Interdependence__likert"] = out["Reciprocal Interdependence"].apply(lambda _: None)
+
+    if just_like  and just_like  in df.columns: out["Justification__likert"]              = df[just_like]
+    else:                                         out["Justification__likert"]              = out["Justification"].apply(lambda _: None)
+
+    if ref_like   and ref_like   in df.columns: out["Reference__likert"]                  = df[ref_like]
+    else:                                         out["Reference__likert"]                  = out["Reference"].apply(lambda _: None)
+
+    # 9) Keep rows with any meaningful payload
     payload = ["Target", "Target description", "Justification", "Reference"]
-    masks = []
-    for k in payload:
-        if k in out:
-            s = out[k]
-            masks.append(s.notna() & (s.astype(str).str.strip() != ""))
+    masks = [out[c].notna() & (out[c].astype(str).str.strip() != "") for c in payload]
     keep = pd.concat(masks, axis=1).any(axis=1) if masks else pd.Series(False, index=out.index)
     out = out.loc[keep].copy()
 
-    # URL extraction and normalization
-    ref_ser = out["Reference"].astype(str) if "Reference" in out else pd.Series([""]*len(out), index=out.index)
-    url_pat = r"(https?://[^\s\])>]+)"
+    # 10) URLs (use extracted if present in flattened df; else parse Reference)
+    if "URLs|first_url" in df.columns:
+        out["extracted_url"] = df["URLs|first_url"]
+        out["all_urls"]      = df["URLs|all_urls"] if "URLs|all_urls" in df.columns else [[]]*len(out)
+    else:
+        ref_ser = out["Reference"].astype(str)
+        url_pat = r"(https?://[^\s\])>]+)"
+        def normalize_url(u: str):
+            if not isinstance(u, str): return u
+            u = u.rstrip(".，,;)")
+            u = re.sub(r"(https://doi\.org/)+", r"https://doi.org/", u)
+            return u
+        out["extracted_url"] = ref_ser.str.extract(url_pat, expand=False).apply(normalize_url)
+        out["all_urls"] = ref_ser.apply(lambda x: [normalize_url(u) for u in re.findall(url_pat, str(x))])
 
-    def normalize_url(u: str):
-        if not isinstance(u, str): return u
-        u = u.rstrip(".，,;)")
-        u = re.sub(r"(https://doi\.org/)+", r"https://doi.org/", u)  # collapse repeats
-        return u
-
-    out["extracted_url"] = ref_ser.str.extract(url_pat, expand=False).apply(normalize_url)
-    out["all_urls"] = ref_ser.apply(lambda x: [normalize_url(u) for u in re.findall(url_pat, str(x))])
+    # 11) Debug: show what we actually matched (enable when needed)
+    print("[flatten_df] chosen value columns:")
+    print(f"  Goal                        <- {goal_col}")
+    print(f"  Target                      <- {target_col}")
+    print(f"  Target description          <- {tdesc_col}")
+    print(f"  Dimension of Temporality    <- {temp_col}")
+    print(f"  Reciprocal Interdependence  <- {recip_col}")
+    print(f"  Justification               <- {just_col}")
+    print(f"  Reference                   <- {ref_col}")
+    print("[flatten_df] chosen likert columns:")
+    print(f"  Target__likert                     <- {t_like}")
+    print(f"  Target description__likert         <- {tdesc_like}")
+    print(f"  Dimension of Temporality__likert   <- {temp_like}")
+    print(f"  Reciprocal Interdependence__likert <- {recip_like}")
+    print(f"  Justification__likert              <- {just_like}")
+    print(f"  Reference__likert                  <- {ref_like}")
 
     return out
-
 # =========================
 # Elsevier helpers
 # =========================
 def clean_doi_from_url(url: str) -> str | None:
-    """Extract a DOI from arbitrary URL/plain text."""
     m = re.search(r'10\.\d{4,9}/[-._;()/:A-Z0-9]+', url, re.I)
     return m.group(0).rstrip('.') if m else None
 
 def fetch_abstract_title_and_pdf(doi: str, api_key: str | None):
-    """Fetch Elsevier coredata (title/abstract) and PDF link for 10.1016 DOIs."""
     if not api_key:
         return None
     if not doi.lower().startswith("10.1016/"):
@@ -371,7 +442,7 @@ def trigger_download(path: str, *, serve_http: bool = False, http_port: int = 80
     except Exception:
         pass
 
-    # 3) Streamlit (only if running under Streamlit)
+    # 3) Streamlit (if running under Streamlit)
     try:
         import streamlit.runtime  # presence implies Streamlit runtime
         import streamlit as st
@@ -446,7 +517,7 @@ def main():
             print("=== Debug: After extract ===")
             debug_dataframe_structure(df)
 
-        # 2) Flatten to single-level columns and pick relevant fields (with likerts)
+        # 2) Flatten to single-level columns and pick relevant fields
         flat_df = flatten_df(df)
         if args.debug:
             print("=== Debug: After flatten_df ===")
@@ -461,7 +532,7 @@ def main():
                 print("Rows with any URL:",
                       sum(bool(x) for x in flat_df_processed["all_urls"]))
 
-        # 4) Save exactly once (final artifact), then trigger download
+        # 4) Save once, then trigger download
         out_path = Path(args.output_dir) / "flattened_with_elsevier.csv"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         flat_df_processed.to_csv(out_path, index=False)

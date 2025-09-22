@@ -957,7 +957,9 @@ with st.container(border=True):
                         )
 
                     cfg_coref = st.session_state["config_coref"]
-
+                    cooc_mode_val, cooc_tok, cooc_warn = resolve_cooc_backend(cfg_coref)
+                    if enable_cooc and cooc_warn:
+                        st.warning(f"{cooc_warn} Co-occurrence exports will use the spaCy backend.")    
                     # ---- Initialize from existing 'documents' table ----
                     if st.button("Initialize Global Coref (from current DB)"):
                         rows = pd.read_sql_query(
@@ -1002,6 +1004,8 @@ with st.container(border=True):
                                         coref_use_pair_scorer=cfg_coref.get("coref_use_pair_scorer", False),
                                         coref_scorer_threshold=cfg_coref.get("coref_scorer_threshold", 0.25),
                                         coref_pair_scorer=cfg_coref.get("coref_pair_scorer"),
+                                        cooc_mode=cooc_mode_val,
+                                        cooc_hf_tokenizer=cooc_tok,
                                     )
                                     prod = res.get("production_output") or res
 
@@ -1031,7 +1035,12 @@ with st.container(border=True):
                                                 full_text = prod.get("full_text") or ""
                                                 if full_text:
                                                     vocab, rows_c, norms = build_cooc_graph(
-                                                        full_text, window=5, min_count=2, topk_neighbors=10
+                                                       full_text,
+                                                        window=5,
+                                                        min_count=2,
+                                                        topk_neighbors=10,
+                                                        mode=cooc_mode_val,
+                                                        hf_tokenizer=cooc_tok,
                                                     )
                                                     upsert_doc_cooc(cx2, doc_id, vocab, rows_c, norms)
                                             cx2.commit()
@@ -1096,6 +1105,8 @@ with st.container(border=True):
                                         coref_use_pair_scorer=cfg_coref.get("coref_use_pair_scorer", False),
                                         coref_scorer_threshold=cfg_coref.get("coref_scorer_threshold", 0.25),
                                         coref_pair_scorer=cfg_coref.get("coref_pair_scorer"),
+                                        cooc_mode=cooc_mode_val,
+                                        cooc_hf_tokenizer=cooc_tok,
                                     )
                                     prod = res.get("production_output") or res
 
@@ -1124,7 +1135,12 @@ with st.container(border=True):
                                                 full_text = prod.get("full_text") or ""
                                                 if full_text:
                                                     vocab, rows_c, norms = build_cooc_graph(
-                                                        full_text, window=5, min_count=2, topk_neighbors=10
+                                                        full_text,
+                                                        window=5,
+                                                        min_count=2,
+                                                        topk_neighbors=10,
+                                                        mode=cooc_mode_val,
+                                                        hf_tokenizer=cooc_tok,
                                                     )
                                                     upsert_doc_cooc(cx2, this_doc_id, vocab, rows_c, norms)
                                             cx2.commit()

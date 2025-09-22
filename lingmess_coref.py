@@ -5,6 +5,10 @@
 from __future__ import annotations
 import os, re
 from typing import List, Dict, Any, Optional, Tuple
+import spacy                           # noqa
+from fastcoref.spacy_component import spacy_component  # noqa (registers "fastcoref")
+return spacy
+
 
 def _safe_imports(device: str, eager_attn: bool):
     # optional: stabilize attention kernel on some CUDA stacks

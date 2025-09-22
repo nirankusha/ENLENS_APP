@@ -15,6 +15,7 @@ Highlights:
 from __future__ import annotations
 from typing import List, Dict, Any, Tuple, Optional, Literal
 import json
+import re
 
 import ipywidgets as widgets
 from IPython.display import display, HTML, clear_output
@@ -78,6 +79,60 @@ def _normalize_device(requested: Optional[str]) -> str:
         return default
     return default
 
+_PRONOUN_TOKENS = {
+    "he", "she", "it", "they", "him", "her", "them", "his", "hers", "its",
+    "their", "theirs", "we", "us", "i", "you", "yours", "mine", "ours",
+    "himself", "herself", "itself", "ourselves", "themselves", "yourself",
+    "yourselves", "myself"
+}
+
+
+def _normalize_pronoun_token(text: str) -> str:
+    token = re.sub(r"[^a-z]", "", str(text or "").lower())
+    return token
+
+
+def _is_pronoun_like(text: str) -> bool:
+    return _normalize_pronoun_token(text) in _PRONOUN_TOKENS
+
+def attach_chain_edge_tags(chains: List[Dict[str, Any]]) -> None:
+    for ch in chains or []:
+        mentions = ch.get("mentions", []) or []
+        if len(mentions) < 2:
+            ch.setdefault("edges", [])
+            continue
+
+        existing_edges = ch.get("edges") or []
+        if existing_edges and any("tag" in e for e in existing_edges if isinstance(e, dict)):
+            # Already tagged (e.g., LingMess rich output)
+            continue
+
+        for m in mentions:
+            if not isinstance(m, dict):
+                continue
+            if ("is_pronoun" not in m) or (m.get("is_pronoun") is None):
+                m["is_pronoun"] = _is_pronoun_like(m.get("text", ""))
+
+        new_edges: List[Dict[str, Any]] = []
+        last_non_pron: Optional[int] = None
+        for idx in range(1, len(mentions)):
+            ant_idx = last_non_pron if last_non_pron is not None else (idx - 1)
+            if ant_idx < 0 or ant_idx >= len(mentions):
+                ant_idx = idx - 1
+            ant = mentions[ant_idx]
+            ana = mentions[idx]
+            tag = _tag_pair(
+                ant.get("text", ""),
+                ana.get("text", ""),
+                bool(ant.get("is_pronoun")),
+                bool(ana.get("is_pronoun")),
+            )
+            new_edges.append({"antecedent": int(ant_idx), "anaphor": int(idx), "tag": tag})
+            if not bool(ana.get("is_pronoun")):
+                last_non_pron = idx
+
+        ch["edges"] = new_edges
+
 
 # ---------- main ----------
 def _classify_dual(sentence: str, 
@@ -126,17 +181,7 @@ def run_quick_analysis(
     scope   = kwargs.get("coref_scope", "whole_document")
     resolved_text = None
     
-    def _tag_pair(ant_txt, ana_txt, ant_is_pron, ana_is_pron):
-        if ant_is_pron and ana_is_pron:
-            return "PRON-PRON-C"
-        if ant_txt == ana_txt:
-            return "MATCH"
-        if ant_txt in ana_txt or ana_txt in ant_txt:
-            return "CONTAINS"
-        if (not ant_is_pron) and ana_is_pron:
-            return "ENT-PRON"
-        return "OTHER"
-
+    
     # ---------------- LingMess backend ----------------
     if backend == "lingmess":
         chains = []
@@ -181,7 +226,8 @@ def run_quick_analysis(
             # Fallback to your legacy analyzer
             coref = analyze_full_text_coreferences(full_text) or {}
             chains = normalize_chain_mentions(coref.get("chains", []) or [])
-            
+        
+        attach_chain_edge_tags(chains)
     # ---------------- fastcoref default backend ----------------
     else:
         if scope == "windowed":
@@ -199,7 +245,7 @@ def run_quick_analysis(
         else:
             coref = analyze_full_text_coreferences(full_text) or {}
             chains = normalize_chain_mentions(coref.get("chains", []) or [])
-
+        attach_chain_edge_tags(chains)    
     # ------------- Enrich mentions with sent_id via interval tree -------------
     for ch in chains:
         for m in ch.get("mentions", []) or []:
