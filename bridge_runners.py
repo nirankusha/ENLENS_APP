@@ -2,18 +2,31 @@
 # bridge_runners.py
 from typing import Dict, Any, List, Tuple, Optional
 import importlib
+import logging
+
 import inspect
 from helper_addons import NGramIndex
+try:
+    from helper_addons import build_ngram_trie, build_cooc_graph
+except ImportError:
+    build_ngram_trie = None
+    build_cooc_graph = None
 from ENLENS_SpanBert_corefree_prod import run_quick_analysis as _run_quick_span
 
 try:
-    from ENLENS_KP_BERT_corefree_prod import( 
-    build_cooc_graph,
-    run_quick_analysis as _run_quick_kpe)
+    from ENLENS_KP_BERT_corefree_prod import run_quick_analysis as _run_quick_kpe
 except Exception:
     _run_quick_kpe = None
 
-from flexiconc_adapter import export_production_to_flexiconc, upsert_doc_trie
+from flexiconc_adapter import (
+    export_production_to_flexiconc,
+    open_db,
+    upsert_doc_cooc,
+    upsert_doc_trie,
+)
+
+
+logger = logging.getLogger(__name__)
 
 def _unify_sentence_fields(s: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -215,17 +228,36 @@ def run_ingestion_quick(
     db_path = extra.get("flexiconc_db_path")
     doc_id = extra.get("doc_id") or Path(pdf_path).stem
     if db_path:
-        export_production_to_flexiconc(db_path, doc_id, prod, uri=pdf_path, write_embeddings=False)
-        cx = open_db(db_path)
-        try:
-            chains = prod.get("coreference_analysis", {}).get("chains", [])
-            trie_root, trie_idf, chain_grams = build_ngram_trie(chains, char_n=4, token_ns=(2,3))
-            vocab, rows, row_norms = build_cooc_graph(prod["full_text"], window=5, min_count=2, topk_neighbors=10)
-            upsert_doc_trie(cx, doc_id, trie_root, trie_idf, chain_grams)
-            upsert_doc_cooc(cx, doc_id, vocab, rows, row_norms)
-        finally:
-            cx.close()
-    
+        export_production_to_flexiconc(
+            db_path,
+            doc_id,
+            prod,
+            uri=pdf_path,
+            write_embeddings=False,
+        )
+        if callable(build_ngram_trie) and callable(build_cooc_graph):
+            cx = open_db(db_path)
+            try:
+                chains = prod.get("coreference_analysis", {}).get("chains", [])
+                trie_root, trie_idf, chain_grams = build_ngram_trie(
+                    chains,
+                    char_n=4,
+                    token_ns=(2, 3),
+                )
+                vocab, rows, row_norms = build_cooc_graph(
+                    prod["full_text"],
+                    window=5,
+                    min_count=2,
+                    topk_neighbors=10,
+                )
+                upsert_doc_trie(cx, doc_id, trie_root, trie_idf, chain_grams)
+                upsert_doc_cooc(cx, doc_id, vocab, rows, row_norms)
+            finally:
+                cx.close()
+        else:
+            logger.warning(
+                "Skipping trie/co-occ export: helper_addons is missing build_ngram_trie or build_cooc_graph.",
+            )
     try:
         chains = (prod.get("coreference_analysis") or {}).get("chains") or []
         if chains:

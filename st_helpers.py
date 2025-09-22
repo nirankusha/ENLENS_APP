@@ -18,6 +18,109 @@ _LINGMESS_REL_COLORS = {
 def toast_info(msg: str):
     st.toast(msg, icon="✅")
 
+def _format_sentence_selector_label(idx: int, sent_obj: Dict[str, Any]) -> str:
+    """Compose a compact label for the sentence selector dropdown."""
+
+    def _dedupe(seq: Iterable[str]) -> List[str]:
+        seen = set()
+        ordered: List[str] = []
+        for item in seq:
+            if item not in seen:
+                seen.add(item)
+                ordered.append(item)
+        return ordered
+
+    sent_obj = sent_obj or {}
+    raw_text = str(sent_obj.get("sentence_text") or "")
+    snippet_src = " ".join(raw_text.replace("\n", " ").split())
+    if len(snippet_src) > 80:
+        snippet = snippet_src[:77].rstrip() + "…"
+    else:
+        snippet = snippet_src
+
+    cls = sent_obj.get("classification") or {}
+
+    def _fmt_field(value: Any) -> str:
+        if value is None:
+            return "?"
+        text = str(value).strip()
+        return text or "?"
+
+    label_txt = _fmt_field(cls.get("label"))
+    consensus_txt = _fmt_field(cls.get("consensus"))
+
+    conf_val = cls.get("confidence")
+    if conf_val is None:
+        conf_val = cls.get("score")
+    conf_txt: Optional[str] = None
+    if isinstance(conf_val, (int, float)):
+        try:
+            if math.isnan(float(conf_val)):
+                conf_txt = None
+            else:
+                conf_txt = f"{float(conf_val):.2f}"
+        except Exception:
+            conf_txt = None
+    elif isinstance(conf_val, str):
+        conf_txt = conf_val.strip() or None
+
+    spans = sent_obj.get("span_analysis") or []
+    chain_hits = 0
+    chain_ids: List[str] = []
+    representatives: List[str] = []
+    chain_found = 0
+    for sp in spans:
+        if not isinstance(sp, dict):
+            continue
+        ca = sp.get("coreference_analysis") or {}
+        if not isinstance(ca, dict):
+            continue
+        if ca.get("chain_found") or ca.get("chain_id") is not None:
+            chain_found += 1
+
+        hits = ca.get("chain_hits")
+        if hits is not None:
+            try:
+                chain_hits += int(float(hits))
+            except Exception:
+                pass
+
+        chain_id = ca.get("chain_id")
+        if chain_id is not None:
+            chain_ids.append(str(chain_id))
+
+        rep = ca.get("representative")
+        if rep:
+            rep_txt = " ".join(str(rep).split())
+            if rep_txt:
+                representatives.append(rep_txt)
+
+    unique_ids = _dedupe(chain_ids)
+    unique_reps = _dedupe(representatives)
+
+    base_count = max(len(unique_ids), chain_found)
+    chain_summary = str(base_count)
+    if chain_hits:
+        chain_summary = f"{chain_summary}({chain_hits})"
+    elif unique_reps:
+        trimmed = []
+        for rep in unique_reps[:2]:
+            if len(rep) > 12:
+                trimmed.append(rep[:12].rstrip() + "…")
+            else:
+                trimmed.append(rep)
+        if trimmed:
+            chain_summary = f"{chain_summary}:{'|'.join(trimmed)}"
+
+    sdg_summary = f"{label_txt}/{consensus_txt}"
+    if conf_txt:
+        sdg_summary = f"{sdg_summary}@{conf_txt}"
+
+    meta = f"{idx:03d} · chains={chain_summary} · SDG={sdg_summary}"
+    return f"{meta}: {snippet}" if snippet else meta
+
+
+
 def make_sentence_selector(production_output: Dict[str, Any] | None, selected_idx: int):
     """Return (idx, sentence_obj) or (0, None) if nothing to pick."""
     if not production_output:
@@ -26,7 +129,7 @@ def make_sentence_selector(production_output: Dict[str, Any] | None, selected_id
     if not sents:
         return 0, None
 
-    labels = [f"{i:03d}: {(s.get('sentence_text','') or '').strip()[:80]}"
+    labels = [_format_sentence_selector_label(i, s)
               for i, s in enumerate(sents)]
     idx = st.selectbox(
         "Pick sentence",

@@ -31,7 +31,13 @@ def ingest_production_output(cx, prod_path: str, doc_id: str, *, also_cooc: bool
     if also_cooc:
         full_text = po.get("full_text") or ""
         if full_text.strip():
-            vocab, rows, row_norms = build_cooc_graph(full_text, window=5, min_count=2, topk_neighbors=10)
+            vocab, rows, row_norms = build_cooc_graph(
+                full_text,
+                window=5,
+                min_count=2,
+                topk_neighbors=10,
+                mode="spacy",
+                )
             upsert_doc_cooc(cx, doc_id, vocab, rows, row_norms)
             print(f"[OK] Upserted cooc for doc_id={doc_id}: |V|={len(vocab)}")
         else:

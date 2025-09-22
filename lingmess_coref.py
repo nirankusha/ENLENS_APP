@@ -33,6 +33,11 @@ LINGMESS_CATEGORIES = {
 
 _PRON_SET = {"he","she","it","they","him","her","them","his","hers","its","their","theirs"}
 
+def ensure_fastcoref_component():
+    """Ensure the LingMess fastcoref spaCy component is registered."""
+    from fastcoref.spacy_component import spacy_component  # noqa: F401 (registration side-effect)
+    return spacy_component
+
 def make_lingmess_nlp(device: str = "cpu", eager_attention: bool = True):
     """
     Returns (nlp, resolver). Safe to call once and cache.

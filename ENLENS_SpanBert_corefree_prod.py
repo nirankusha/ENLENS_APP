@@ -41,7 +41,7 @@ from global_coref_helper import (
 )
 
 from span_chains import _map_span_to_chain, _build_chain_trees
-from lingmess_coref import make_lingmess_nlp, run_lingmess_coref
+from lingmess_coref import ensure_fastcoref_component, make_lingmess_nlp, run_lingmess_coref
 
 # ---------- main ----------
 def _classify_dual(sentence: str, 
@@ -106,8 +106,7 @@ def run_quick_analysis(
         chains = []
         try:
             # Use helper for robust parsing + edges
-            from fast_coref.spacy_component import spacy_component
-            from lingmess_coref import make_lingmess_nlp, run_lingmess_coref
+            ensure_fastcoref_component()
             
             coref_device = kwargs.get("coref_device", "cpu")
             want_resolved = bool(kwargs.get("resolve_text", True))

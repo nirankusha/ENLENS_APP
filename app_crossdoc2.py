@@ -33,7 +33,8 @@ from utils_upload import save_uploaded_pdf
 # (writer bits used for corpus/global indices)
 from global_coref_helper import global_coref_query, _make_grams, _idf_weighted_jaccard
 
-# Optional co-occ (guarded)
+from cooc_utils import resolve_cooc_backend, cooc_backend_ready
+
 from flexiconc_adapter import (
     open_db, export_production_to_flexiconc,
     upsert_doc_trie, upsert_doc_cooc,
@@ -578,12 +579,28 @@ with st.sidebar:
             if st.button("Run PDF analysis"):
                 cfg_ing = st.session_state["config_ingest"]
                 cfg_ui  = st.session_state["config_ui"]
+                cfg_coref = st.session_state["config_coref"]
+                cooc_mode_val, cooc_tok, cooc_warn = resolve_cooc_backend(cfg_coref)
                 res = run_ingestion_quick(
                     pdf_path,
                     max_sentences=cfg_ing["max_sentences"],
                     max_text_length=cfg_ing["max_text_length"],
                     candidate_source=cfg_ui.get("candidate_source", "span"),
-                    coref_shortlist_mode="trie",   # if you want trie-only
+                    coref_backend=cfg_coref.get("engine", "fastcoref"),
+                    coref_device=cfg_coref.get("device"),
+                    coref_scope=cfg_coref.get("scope"),
+                    coref_window_sentences=cfg_coref.get("window_sentences"),
+                    coref_window_stride=cfg_coref.get("window_stride"),
+                    resolve_text=cfg_coref.get("resolve_text"),
+                    coref_shortlist_mode=cfg_coref.get("coref_shortlist_mode", "trie"),
+                    coref_shortlist_topk=cfg_coref.get("coref_shortlist_topk"),
+                    coref_trie_tau=cfg_coref.get("coref_trie_tau"),
+                    coref_cooc_tau=cfg_coref.get("coref_cooc_tau"),
+                    coref_use_pair_scorer=cfg_coref.get("coref_use_pair_scorer"),
+                    coref_scorer_threshold=cfg_coref.get("coref_scorer_threshold"),
+                    coref_pair_scorer=cfg_coref.get("coref_pair_scorer"),
+                    cooc_mode=cooc_mode_val,
+                    cooc_hf_tokenizer=cooc_tok,
                 )
                 st.session_state["results"] = res.get("production_output")
                 st.session_state["last_uri"] = pdf_path
@@ -645,15 +662,54 @@ with st.sidebar:
         with st.expander("Coref shortlisting", expanded=False):
             cfg_coref = st.session_state["config_coref"]
 
+            _cooc_modes = ["spacy", "hf"]
+            current_cooc_mode = str(cfg_coref.get("cooc_mode", "spacy")).lower()
+            if current_cooc_mode not in _cooc_modes:
+                current_cooc_mode = "spacy"
+            cfg_coref["cooc_mode"] = st.selectbox(
+                "Co-occurrence backend",
+                _cooc_modes,
+                index=_cooc_modes.index(current_cooc_mode),
+                help="spaCy uses the loaded language model; HF requires a HuggingFace tokenizer.",
+            )
+            if cfg_coref["cooc_mode"] == "hf":
+                cfg_coref["cooc_hf_tokenizer"] = st.text_input(
+                    "HF tokenizer (name or path)",
+                    value=cfg_coref.get("cooc_hf_tokenizer", ""),
+                    help="Leave blank to reuse helper.bert_tokenizer if available.",
+                )
+            else:
+                cfg_coref.setdefault("cooc_hf_tokenizer", cfg_coref.get("cooc_hf_tokenizer", ""))
+
+            # build options
+            shortlist_options = ["off", "trie"]
+            current_shortlist = cfg_coref.get("coref_shortlist_mode", "trie")
+            
+            cooc_ready, cooc_msg = cooc_backend_ready(cfg_coref)
+            if cooc_ready:
+                shortlist_options.extend(["cooc", "both"])
+            else:
+                if current_shortlist in ("cooc", "both"):
+                        current_shortlist = "trie"
+                if cooc_msg:
+                        st.info(cooc_msg)
+
+            if current_shortlist not in shortlist_options:
+                current_shortlist = "trie"
+
+            # dropdown
             cfg_coref["coref_shortlist_mode"] = st.selectbox(
-                             "Shortlist mode",
-                             ["off","trie","cooc","both"],
-                             index=["off","trie","cooc","both"].index(cfg_coref.get("coref_shortlist_mode","trie")),
-                             help="off = no shortlist, trie = token-trie only, cooc = co-occ only, both = union"
-                             )
+                "Shortlist mode",
+                options=shortlist_options,
+                index=shortlist_options.index(current_shortlist),
+                help="off = no shortlist, trie = token-trie only, cooc = co-occ only, both = union",
+                key="coref_shortlist_mode",
+                )       
+
             cfg_coref["coref_shortlist_topk"] = st.slider(
                  "Top-K candidates", 1, 200, cfg_coref.get("coref_shortlist_topk", 50)
                  )
+
             cfg_coref["coref_trie_tau"] = st.slider(
                 "Trie τ (WJacc)", 0.00, 1.00, cfg_coref.get("coref_trie_tau", 0.18), 0.01
                 )
@@ -749,12 +805,26 @@ with st.container(border=True):
         if st.button("Run PDF analysis", type="primary", disabled=not p):
             with st.spinner("Analyzing…"):
                 cfg_coref = st.session_state["config_coref"]
+                cooc_mode_val, cooc_tok, cooc_warn = resolve_cooc_backend(cfg_coref)
                 res = run_ingestion_quick(
                     pdf_path=p,
                     max_sentences=st.session_state["config_ingest"]["max_sentences"],
                     max_text_length=st.session_state["config_ingest"]["max_text_length"],
                     # Add the candidate source selection
                     candidate_source=st.session_state["config_ui"]["candidate_source"],
+                    coref_backend=cfg_coref.get("engine", "fastcoref"),
+                    coref_device=cfg_coref.get("device"),
+                    coref_scope=cfg_coref.get("scope"),
+                    coref_window_sentences=cfg_coref.get("window_sentences"),
+                    coref_window_stride=cfg_coref.get("window_stride"),
+                    resolve_text=cfg_coref.get("resolve_text"),
+                    coref_shortlist_mode=cfg_coref.get("coref_shortlist_mode"),
+                    coref_shortlist_topk=cfg_coref.get("coref_shortlist_topk"),
+                    coref_trie_tau=cfg_coref.get("coref_trie_tau"),
+                    coref_cooc_tau=cfg_coref.get("coref_cooc_tau"),
+                    coref_use_pair_scorer=cfg_coref.get("coref_use_pair_scorer"),
+                    coref_scorer_threshold=cfg_coref.get("coref_scorer_threshold"),
+                    coref_pair_scorer=cfg_coref.get("coref_pair_scorer"),
                     ig_enabled=st.session_state["config_explain"]["ig_enabled"],
                     span_masking_enabled=st.session_state["config_explain"]["span_masking_enabled"],
                     max_span_len=st.session_state["config_explain"]["max_span_len"],
@@ -765,6 +835,8 @@ with st.container(border=True):
                     agree_threshold=st.session_state["config_sdg"]["agree_threshold"],
                     disagree_threshold=st.session_state["config_sdg"]["disagree_threshold"],
                     min_confidence=st.session_state["config_sdg"]["min_confidence"],
+                    cooc_mode=cooc_mode_val,
+                    cooc_hf_tokenizer=cooc_tok,
                 )
                 st.session_state["results"] = res
                 st.session_state["last_uri"] = p
@@ -866,6 +938,9 @@ with st.container(border=True):
                                         coref_backend=cfg_coref.get("engine", "fastcoref"),
                                         coref_device=cfg_coref.get("device", "cpu"),
                                         resolve_text=cfg_coref.get("resolve_text", True),
+                                        coref_scope=cfg_coref.get("scope"),
+                                        coref_window_sentences=cfg_coref.get("window_sentences"),
+                                        coref_window_stride=cfg_coref.get("window_stride"),
                                         # shortlist knobs (controls internal trie/cooc shortlisting for span→chain mapping)
                                         coref_shortlist_mode=coref_mode,
                                         coref_shortlist_topk=cfg_coref["coref_shortlist_topk"],
@@ -873,6 +948,7 @@ with st.container(border=True):
                                         coref_cooc_tau=cfg_coref["coref_cooc_tau"],
                                         coref_use_pair_scorer=cfg_coref.get("coref_use_pair_scorer", False),
                                         coref_scorer_threshold=cfg_coref.get("coref_scorer_threshold", 0.25),
+                                        coref_pair_scorer=cfg_coref.get("coref_pair_scorer"),
                                     )
                                     prod = res.get("production_output") or res
 
@@ -957,11 +1033,16 @@ with st.container(border=True):
                                         coref_device=cfg_coref.get("device", "cpu"),
                                         resolve_text=cfg_coref.get("resolve_text", True),
                                         coref_shortlist_mode=coref_mode,
+                                        coref_scope=cfg_coref.get("scope"),
+                                        coref_window_sentences=cfg_coref.get("window_sentences"),
+                                        coref_window_stride=cfg_coref.get("window_stride"),
+                                        
                                         coref_shortlist_topk=cfg_coref["coref_shortlist_topk"],
                                         coref_trie_tau=cfg_coref["coref_trie_tau"],
                                         coref_cooc_tau=cfg_coref["coref_cooc_tau"],
                                         coref_use_pair_scorer=cfg_coref.get("coref_use_pair_scorer", False),
                                         coref_scorer_threshold=cfg_coref.get("coref_scorer_threshold", 0.25),
+                                        coref_pair_scorer=cfg_coref.get("coref_pair_scorer"),
                                     )
                                     prod = res.get("production_output") or res
 
@@ -1144,17 +1225,28 @@ with st.container(border=True):
                                     cfg_ing  = st.session_state["config_ingest"]
                                     cfg_ui   = st.session_state["config_ui"]
                                     cfg_coref = st.session_state["config_coref"]
+                                    cooc_mode_val, cooc_tok, cooc_warn = resolve_cooc_backend(cfg_coref)
+                                    if cooc_warn and cfg_coref.get("coref_shortlist_mode") in ("cooc", "both"):
+                                        st.warning(cooc_warn)
                                     res = run_ingestion_quick(
                                         pdf_path=uri,
                                         max_sentences=cfg_ing["max_sentences"],
                                         max_text_length=cfg_ing["max_text_length"],
-                                        candidate_source=cfg_ui.get("candidate_source", "span"),
-                                        coref_shortlist_mode=cfg_coref["coref_shortlist_mode"],
-                                        coref_shortlist_topk=cfg_coref["coref_shortlist_topk"],
-                                        coref_trie_tau=cfg_coref["coref_trie_tau"],
-                                        coref_cooc_tau=cfg_coref["coref_cooc_tau"],
+                                        coref_backend=cfg_coref.get("engine", "fastcoref"),
+                                        coref_device=cfg_coref.get("device"),
+                                        coref_scope=cfg_coref.get("scope"),
+                                        coref_window_sentences=cfg_coref.get("window_sentences"),
+                                        coref_window_stride=cfg_coref.get("window_stride"),
+                                        resolve_text=cfg_coref.get("resolve_text"),
+                                        coref_shortlist_mode=cfg_coref.get("coref_shortlist_mode"),
+                                        coref_shortlist_topk=cfg_coref.get("coref_shortlist_topk"),
+                                        coref_trie_tau=cfg_coref.get("coref_trie_tau"),
+                                        coref_cooc_tau=cfg_coref.get("coref_cooc_tau"),
                                         coref_use_pair_scorer=cfg_coref.get("coref_use_pair_scorer", False),
                                         coref_scorer_threshold=cfg_coref.get("coref_scorer_threshold", 0.25),
+                                        coref_pair_scorer=cfg_coref.get("coref_pair_scorer"),
+                                        cooc_mode=cooc_mode_val,
+                                        cooc_hf_tokenizer=cooc_tok,
                                     )
                                     # attach uri for display; cache rows for single-doc concordance
                                     res = dict(res or {})
