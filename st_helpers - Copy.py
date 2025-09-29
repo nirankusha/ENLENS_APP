@@ -398,16 +398,11 @@ def render_coref_panel(coref_groups, production_output, mode: str = "document"):
 
     TAG_COLORS = {
         "PRON-PRON-C": "#6e8efb",
-        "PRON_PRON_C": "#6e8efb",
         "PRON-PRON-NC": "#a1a1a1",
-        "PRON_PRON_NC": "#a1a1a1",
         "ENT-PRON":     "#56b881",
-        "ENT_PRON":     "#56b881",
         "MATCH":        "#e6b422",
         "CONTAINS":     "#e86a5f",
         "OTHER":        "#999999",
-        "NO_RELATION":  "#999999",
-        "NOT_COREF":    "#999999",
         None:           "#cccccc",
     }
 
@@ -420,27 +415,14 @@ def render_coref_panel(coref_groups, production_output, mode: str = "document"):
         # Summarize relationships if present
         rel_chips_html = ""
         edge_rows = []
-        
+
         if chain:
             edges = chain.get("edges") or []
             if edges:
                 counts = Counter(str(e.get("tag") or e.get("relation") or "OTHER") for e in edges)
-                def _canon_tag(tag_val: Any) -> str:
-                    tag_txt = str(tag_val).strip().upper() if tag_val is not None else ""
-                    tag_txt = tag_txt.replace("-", "_")
-                    return tag_txt or "OTHER"
-
-                def _edge_tag(edge: Dict[str, Any]) -> str:
-                    if isinstance(edge, dict):
-                        for key in ("tag", "relation", "lingmess_relation", "heuristic"):
-                            if edge.get(key):
-                                return _canon_tag(edge.get(key))
-                    return "OTHER"
-
-                counts = Counter(_edge_tag(e) for e in edges)
                 chips = []
                 for tag, cnt in counts.items():
-                    color = TAG_COLORS.get(tag, TAG_COLORS.get(tag.replace("_", "-"), "#999999"))
+                    color = TAG_COLORS.get(tag, "#999999")
                     chips.append(
                         f"<span style='display:inline-block;padding:2px 6px;border-radius:6px;"
                         f"background:{color};color:white;font-size:11px;margin-right:6px;'>{html.escape(tag)}: {cnt}</span>"
@@ -453,14 +435,14 @@ def render_coref_panel(coref_groups, production_output, mode: str = "document"):
                 for e in edges[:max_show]:
                     i = e.get("antecedent", e.get("i"))
                     j = e.get("anaphor", e.get("j"))
-                    tag = _edge_tag(e)
+                    tag = str(e.get("tag") or e.get("relation") or "OTHER")
                     try:
                         i = int(i); j = int(j)
                     except Exception:
                         continue
                     m1 = mlist[i]["text"] if isinstance(i, int) and 0 <= i < len(mlist) else "?"
                     m2 = mlist[j]["text"] if isinstance(j, int) and 0 <= j < len(mlist) else "?"
-                    edge_rows.append((tag, m1, m2, e.get("heuristic"), e.get("relation_source"), e.get("lingmess_relation"), e.get("lingmess_score")))
+                    edge_rows.append((tag, m1, m2))
 
         with st.expander(f"Chain {cid} • sentences: {len(items)}", expanded=False):
             # Relationships summary chips (if any)
@@ -498,22 +480,12 @@ def render_coref_panel(coref_groups, production_output, mode: str = "document"):
             # Optional: show a compact edge list
             if edge_rows:
                 with st.expander("Relationships (pairs)", expanded=False):
-                    for tag, m1, m2, heuristic_rel, relation_source, lingmess_rel, lingmess_score in edge_rows:
-                        color = TAG_COLORS.get(tag, TAG_COLORS.get(tag.replace("_", "-"), "#999999"))
-                        extras = []
-                        if lingmess_rel and lingmess_rel != tag:
-                            extras.append(f"LingMess={html.escape(str(lingmess_rel))}")
-                        if heuristic_rel and heuristic_rel != tag:
-                            extras.append(f"heuristic={html.escape(str(heuristic_rel))}")
-                        if relation_source and relation_source != "lingmess":
-                            extras.append(f"source={html.escape(str(relation_source))}")
-                        if isinstance(lingmess_score, (int, float)):
-                            extras.append(f"score={lingmess_score:.3f}")
-                        extra_txt = f" ({', '.join(extras)})" if extras else ""
+                    for tag, m1, m2 in edge_rows:
+                        color = TAG_COLORS.get(tag, "#999999")
                         st.markdown(
                             f"<span style='display:inline-block;padding:2px 6px;border-radius:6px;"
                             f"background:{color};color:white;font-size:11px;margin-right:6px;'>{html.escape(tag)}</span>"
-                            f"“{html.escape(m1)}” ↔ “{html.escape(m2)}”{extra_txt}",
+                            f"“{html.escape(m1)}” ↔ “{html.escape(m2)}”",
                             unsafe_allow_html=True,
                         )
 

@@ -95,26 +95,18 @@ def _normalize_pronoun_token(text: str) -> str:
 def _is_pronoun_like(text: str) -> bool:
     return _normalize_pronoun_token(text) in _PRONOUN_TOKENS
 
-def _tag_pair(ant_txt: str, ana_txt: str, ant_is_pron: bool, ana_is_pron: bool) -> str:
-    """Return UI-friendly edge tags for antecedent/anaphor pairs."""
-    ant_txt = (ant_txt or "").strip()
-    ana_txt = (ana_txt or "").strip()
 
+def _tag_pair(ant_txt, ana_txt, ant_is_pron, ana_is_pron):
     if ant_is_pron and ana_is_pron:
-        ant_norm = _normalize_pronoun_token(ant_txt)
-        ana_norm = _normalize_pronoun_token(ana_txt)
-        return "PRON-PRON-C" if ant_norm and ant_norm == ana_norm else "PRON-PRON-NC"
-
-    if ant_txt and ant_txt == ana_txt:
+        return "PRON-PRON-C"
+    if ant_txt == ana_txt:
         return "MATCH"
-
-    if ant_txt and ana_txt and (ant_txt in ana_txt or ana_txt in ant_txt):
+    if ant_txt in ana_txt or ana_txt in ant_txt:
         return "CONTAINS"
-
     if (not ant_is_pron) and ana_is_pron:
         return "ENT-PRON"
-
     return "OTHER"
+
 
 def attach_chain_edge_tags(chains: List[Dict[str, Any]]) -> None:
     for ch in chains or []:
@@ -153,7 +145,6 @@ def attach_chain_edge_tags(chains: List[Dict[str, Any]]) -> None:
                 last_non_pron = idx
 
         ch["edges"] = new_edges
-
 
 # ---------- main ----------
 def _classify_dual(sentence: str, 
