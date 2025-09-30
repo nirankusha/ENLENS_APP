@@ -34,7 +34,7 @@ from bridge_runners import (
     build_concordance, pick_sentence_coref_groups
 )
 from utils_upload import save_uploaded_pdf
-
+from helper import encode_mpnet, encode_sdg_hidden, encode_scico
 # (writer bits used for corpus/global indices)
 from global_coref_helper import global_coref_query, _make_grams, _idf_weighted_jaccard
 
@@ -52,6 +52,11 @@ try:
 except Exception:
     _HAVE_COOCC_LOCAL = False
 
+DEFAULT_EMBEDDING_MODELS = {
+    "mpnet": encode_mpnet,
+    "sdg-bert": encode_sdg_hidden,
+    "scico": encode_scico,
+}
 # -------------------- Page config --------------------
 st.set_page_config(page_title="Cross-Doc SDG Explorer", layout="wide", initial_sidebar_state="expanded")
 st.markdown("<h2>📚 Cross-Doc SDG Explorer</h2>", unsafe_allow_html=True)
@@ -1019,7 +1024,13 @@ with st.container(border=True):
                                         cx1.close()
 
                                     # 2) Export the production (uses its own connection internally)
-                                    export_production_to_flexiconc(db_path, doc_id, prod, uri=uri, write_embeddings=False)
+                                    export_production_to_flexiconc(
+                                        db_path,
+                                        doc_id,
+                                        prod,
+                                        uri=uri,
+                                        embedding_models=DEFAULT_EMBEDDING_MODELS,
+                                    )
 
                                     # 3) Build & persist per-doc indices (reopen a new connection)
                                     chains = (prod.get("coreference_analysis") or {}).get("chains") or []
@@ -1120,7 +1131,13 @@ with st.container(border=True):
                                         cx1.close()
 
                                     # 2) Export the production
-                                    export_production_to_flexiconc(db_path, this_doc_id, prod, uri=this_uri, write_embeddings=False)
+                                    export_production_to_flexiconc(
+                                        db_path,
+                                        doc_id,
+                                        prod,
+                                        uri=uri,
+                                        embedding_models=DEFAULT_EMBEDDING_MODELS,
+                                    )
 
                                     # 3) Build & persist per-doc indices
                                     chains = (prod.get("coreference_analysis") or {}).get("chains") or []

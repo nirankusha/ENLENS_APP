@@ -112,7 +112,33 @@ def _ensure_schema(conn: sqlite3.Connection):
 
 def _migrate_documents_table(conn: sqlite3.Connection):
     cur = conn.cursor()
-    cols = {r[1] for r in cur.execute("PRAGMA table_info(documents)").fetchall()}
+    try:
+        info = cur.execute("PRAGMA table_info(documents)").fetchall()
+    except sqlite3.OperationalError:
+        info = []
+   
+    cols = {r[1] for r in info}
+
+    doc_id_info = next((r for r in info if r[1] == "doc_id"), None)
+    if doc_id_info:
+        declared_type = (doc_id_info[2] or "").strip().upper()
+        is_integer_pk = declared_type.startswith("INT") and bool(doc_id_info[5])
+        if is_integer_pk:
+            cur.execute("ALTER TABLE documents RENAME TO documents_old")
+            conn.commit()
+
+            _ensure_schema(conn)
+
+            old_info = cur.execute("PRAGMA table_info(documents_old)").fetchall()
+            old_cols = {r[1] for r in old_info}
+
+            insert_cols = ["doc_id", "uri", "created_at", "text_length", "full_text"]
+            select_exprs = [
+                "CAST(doc_id AS TEXT) AS doc_id",
+                "uri" if "uri" in old_cols else "NULL AS uri",
+                "created_at" if "created_at" in old_cols else "NULL AS created_at",
+            ]
+            
     if "text_length" not in cols:
         cur.execute("ALTER TABLE documents ADD COLUMN text_length INTEGER")
     if "full_text" not in cols:

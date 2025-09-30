@@ -385,7 +385,21 @@ def pick_sentence_coref_groups(production_output: Dict[str, Any], sent_idx: int)
         idx_payload = (production_output.get("indices") or {}).get("coref_ngram")
     except Exception:
         idx_payload = None
-
+        
+    # Pre-compute sentence spans so we can fall back to doc offsets if needed.
+    sent_spans: List[Tuple[Optional[int], Optional[int]]] = []
+    for sent in sents:
+        start = sent.get("doc_start")
+        end = sent.get("doc_end")
+        try:
+            start = int(start) if start is not None else None
+        except (TypeError, ValueError):
+            start = None
+        try:
+            end = int(end) if end is not None else None
+        except (TypeError, ValueError):
+            end = None
+        sent_spans.append((start, end))
     if idx_payload:
         # Rehydrate from stored payload
         ng_index = NGramIndex.from_dict(idx_payload)
@@ -428,6 +442,38 @@ def pick_sentence_coref_groups(production_output: Dict[str, Any], sent_idx: int)
             sid = m.get("sent_id")
             if sid is None or sid >= len(sents):
                 continue
+            if sid is not None:
+                try:
+                    sid = int(sid)
+                except (TypeError, ValueError):
+                    sid = None
+            if sid is None or sid < 0 or sid >= len(sents):
+                # Attempt to locate the sentence by absolute char offsets.
+                start_char = m.get("start_char")
+                end_char = m.get("end_char")
+                if start_char is None or end_char is None:
+                    start_char = m.get("start")
+                    end_char = m.get("end")
+                try:
+                    start_char = int(start_char) if start_char is not None else None
+                except (TypeError, ValueError):
+                    start_char = None
+                try:
+                    end_char = int(end_char) if end_char is not None else None
+                except (TypeError, ValueError):
+                    end_char = None
+
+                if start_char is not None and end_char is not None:
+                    for idx, (span_start, span_end) in enumerate(sent_spans):
+                        if span_start is None or span_end is None:
+                            continue
+                        if span_start <= start_char and end_char <= span_end:
+                            sid = idx
+                            m["sent_id"] = sid
+                            break
+
+                if sid is None or sid < 0 or sid >= len(sents):
+                    continue
             rec = sent_map.setdefault(sid, {
                 "sid": sid,
                 "text": sents[sid].get("sentence_text", ""),
