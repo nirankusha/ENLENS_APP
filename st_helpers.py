@@ -518,11 +518,53 @@ def render_coref_panel(coref_groups, production_output, mode: str = "document"):
                         )
 
 def render_concordance_panel(conc_results):
+    """Render concordance rows along with backend metadata."""
     if not conc_results:
         st.info("No concordance results.")
         return
-    st.caption(f"Results: {len(conc_results)}")
-    for r in conc_results[:200]:
+    
+    rows: List[Dict[str, Any]]
+    meta: Dict[str, Any] = {}
+    terms: List[str] = []
+
+    if isinstance(conc_results, dict):
+        rows = list(conc_results.get("rows", []) or [])
+        meta = conc_results.get("meta") or {}
+        terms = list(conc_results.get("terms", []) or [])
+    else:
+        # Legacy adapters may still return a list – keep rendering them.
+        rows = list(conc_results)
+
+    if not rows:
+        st.info("No concordance matches found.")
+    summary_bits: List[str] = [f"Results: {len(rows)}"]
+    if terms:
+        summary_bits.append("Terms: " + ", ".join(map(str, terms)))
+
+    mode = meta.get("mode") if isinstance(meta, dict) else None
+    if mode:
+        summary_bits.append(f"Mode: {mode}")
+
+    vector_backend = meta.get("vector_backend") if isinstance(meta, dict) else None
+    if vector_backend:
+        summary_bits.append(f"Vector backend: {vector_backend}")
+
+    faiss_used = meta.get("faiss_used") if isinstance(meta, dict) else None
+    if faiss_used is not None:
+        summary_bits.append(f"FAISS: {'yes' if faiss_used else 'no'}")
+
+    total_candidates = meta.get("total_candidates") if isinstance(meta, dict) else None
+    if isinstance(total_candidates, int):
+        summary_bits.append(f"Candidates scanned: {total_candidates}")
+
+    if summary_bits:
+        st.caption(" • ".join(summary_bits))
+
+    query_text = meta.get("query_text") if isinstance(meta, dict) else None
+    if query_text:
+        st.caption(f"Query: `{query_text}`")
+
+    for r in rows[:200]:
         st.markdown(
             f"- `{r.get('path','')}` [{r.get('start','?')}:{r.get('end','?')}] — "
             f"{(r.get('text','') or '')[:160]}"

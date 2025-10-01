@@ -545,7 +545,6 @@ def build_graph_from_selection(
     summarize_on: str = "community",             # "community" | "kmeans" | "torque"
     summary_methods: Optional[List[str]] = None, # any of ["centroid","xsum","presumm"]
     summary_opts: Optional[Dict[str, Any]] = None,
-    summary_opts: Optional[Dict[str, Any]] = None,
     precomputed_embeddings: Optional[Any] = None,
     feature_cache: Optional[GraphFeatureCache] = None,
     cache_control: Optional[Dict[str, Any]] = None,
