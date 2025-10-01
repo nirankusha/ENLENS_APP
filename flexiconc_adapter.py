@@ -129,6 +129,13 @@ def _ensure_schema(conn: sqlite3.Connection):
 
 def _migrate_documents_table(conn: sqlite3.Connection, *, force_rebuild: bool = False):
     cur = conn.cursor()
+    
+    table_rows = cur.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('documents', 'documents_old')"
+    ).fetchall()
+    tables = {row[0] for row in table_rows}
+
+    
     try:
         info = cur.execute("PRAGMA table_info(documents)").fetchall()
     except sqlite3.OperationalError:
@@ -140,7 +147,7 @@ def _migrate_documents_table(conn: sqlite3.Connection, *, force_rebuild: bool = 
     declared_type = ""
     is_integer_pk = False
     if doc_id_info:
-        declared_type = (doc_id_info[2] or "").strip().upper()
+        declared_type = (doc_id_info[2] or "").upper().lstrip()
         is_integer_pk = declared_type.startswith("INT") and bool(doc_id_info[5])
         
         
