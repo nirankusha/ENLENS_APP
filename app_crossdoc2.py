@@ -46,6 +46,7 @@ from flexiconc_adapter import (
     open_db, export_production_to_flexiconc,
     upsert_doc_trie, upsert_doc_cooc,
     count_indices, list_index_sizes,
+    build_faiss_indices,
 )
 from helper_addons import build_ngram_trie
 try:
@@ -95,6 +96,11 @@ def _init_state():
     ss.setdefault("filter_local_coref", False)
     ss.setdefault("local_chain_grams", None)
     ss.setdefault("scico_panel_data", None)
+    
+    ss.setdefault("sidebar_pdf_dir", "")
+    ss.setdefault("sidebar_new_db_path", "")
+    ss.setdefault("sidebar_enable_cooc", False)
+    ss.setdefault("sidebar_coref_mode", "trie")
 _init_state()
 
 def _available_coref_devices() -> List[str]:
@@ -460,6 +466,8 @@ def _prepare_scico_panel(
     doc_label: Optional[str] = None,
     include_chains: Optional[Iterable[int]] = None,
     is_current_doc: bool = False,
+    precomputed_embeddings: Any = None,
+    embedding_provider: Optional[Callable[[List[str]], Any]] = None,
 ) -> Dict[str, Any]:
     panel: Dict[str, Any] = {
         "source": source,
@@ -1078,7 +1086,7 @@ with st.sidebar:
     st.session_state["filter_local_coref"] = st.checkbox(
             "Filter local coref by committed phrases", value=st.session_state["filter_local_coref"]
         )
-    
+    ingest_submit = False
     if doc_mode == "document":
         up = st.file_uploader("Upload PDF", type=["pdf"])
         if up:
@@ -1113,14 +1121,78 @@ with st.sidebar:
                 st.session_state["results"] = res.get("production_output")
                 st.session_state["last_uri"] = pdf_path
     else:
-        dbp = st.text_input("FlexiConc SQLite path", value=st.session_state["db_path"])
-        st.session_state["db_path"] = dbp
+        dbp_raw = st.text_input("FlexiConc SQLite path", value=st.session_state["db_path"])
+        dbp = os.path.expanduser(dbp_raw.strip()) if dbp_raw else dbp_raw
+        if dbp:
+            st.session_state["db_path"] = dbp
+
+        ss = st.session_state
+        ss.setdefault("source_root", ss.get("source_root", ""))
+        ss.setdefault("sidebar_pdf_dir_input", ss.get("source_root", ""))
+        ss.setdefault("sidebar_new_db_dest_input", "")
+        ss.setdefault("sidebar_enable_cooc", False)
+        ss.setdefault("sidebar_coref_mode", "trie")
+        
+        with st.form("flexiconc_ingest_sidebar"):
+            st.text_input(
+                "PDF folder to ingest",
+                value=st.session_state.get("sidebar_pdf_dir", ""),
+                key="sidebar_pdf_dir",
+            )
+            st.text_input(
+                "New FlexiConc destination/name (optional)",
+                value=st.session_state.get("sidebar_new_db_path", ""),
+                key="sidebar_new_db_path",
+                help="Provide a file name or path for a new SQLite DB. Leave blank to append to the current DB.",
+            )
+            c_ingest_a, c_ingest_b = st.columns(2)
+            with c_ingest_a:
+                st.checkbox(
+                    "Also build co-occurrence",
+                    key="sidebar_enable_cooc",
+                    help="Requires SciPy CSR support (helper_addons).",
+                    disabled=not _HAVE_COOCC_LOCAL,
+                )
+            with c_ingest_b:
+                st.selectbox(
+                    "Coref shortlist mode",
+                    options=["trie", "both", "none"],
+                    key="sidebar_coref_mode",
+                    help="Passed to run_ingestion_quick for trie/co-occ shortlist generation.",
+                )
+            ingest_submit = st.form_submit_button("Ingest folder into FlexiConc")
         # legacy/relative path support
-        st.session_state["source_root"] = st.text_input(
+        ss["source_root"] = st.text_input(
             "Source folder (optional, e.g. /content/en)",
-            value=st.session_state.get("source_root", "")
+            value=ss.get("source_root", "")
         )
-        cfg_corpus = st.session_state["config_corpus"]
+        with st.form("corpus_ingest_form", clear_on_submit=False):
+            pdf_dir_val = st.text_input(
+                "PDF folder to ingest",
+                key="sidebar_pdf_dir_input",
+                help="Folder containing PDFs to add/update in the FlexiConc database.",
+            )
+            new_db_val = st.text_input(
+                "New FlexiConc destination/name (optional)",
+                key="sidebar_new_db_dest_input",
+                help="Provide a new SQLite path to create/populate a fresh FlexiConc database.",
+            )
+            enable_cooc_sidebar = st.checkbox(
+                "Also build co-occurrence (requires SciPy)",
+                key="sidebar_enable_cooc",
+                help="If available, export co-occurrence graphs for each document.",
+                disabled=not _HAVE_COOCC_LOCAL,
+            )
+            coref_mode_sidebar = st.selectbox(
+                "Coref shortlist mode",
+                options=["trie", "both", "none"],
+                index=["trie", "both", "none"].index(ss.get("sidebar_coref_mode", "trie")),
+                key="sidebar_coref_mode",
+                help="Passed to run_ingestion_quick for trie/co-occurrence shortlist generation.",
+            )
+            ingest_submit = st.form_submit_button("Ingest folder into FlexiConc")
+
+        cfg_corpus = ss["config_corpus"]
         c1, c2 = st.columns([3, 1])
         with c1:
             cfg_corpus["vector_backend"] = st.text_input(
@@ -1134,6 +1206,288 @@ with st.sidebar:
                 value=cfg_corpus.get("use_faiss", True),
                 help="Enable FAISS acceleration when a pre-built embedding index is available.",
             )
+        ingest_status_placeholder = st.empty()
+
+        if ingest_submit:
+            target_pdf_dir = Path(st.session_state.get("sidebar_pdf_dir_input", "")).expanduser()
+            dest_override = st.session_state.get("sidebar_new_db_dest_input", "").strip()
+            target_db = Path(dest_override or st.session_state.get("db_path", "")).expanduser()
+
+            if not target_pdf_dir or not str(target_pdf_dir):
+                ingest_status_placeholder.error("Please provide a PDF folder to ingest.")
+            elif not target_pdf_dir.exists() or not target_pdf_dir.is_dir():
+                ingest_status_placeholder.error(f"PDF folder not found: {target_pdf_dir}")
+            else:
+                try:
+                    target_db.parent.mkdir(parents=True, exist_ok=True)
+                    cx0 = open_db(str(target_db))
+                    cx0.close()
+                except Exception as e:
+                    ingest_status_placeholder.error(f"Unable to open or create FlexiConc DB: {e}")
+                else:
+                    if dest_override:
+                        st.session_state["db_path"] = str(target_db)
+                        st.session_state["sidebar_new_db_dest_input"] = ""
+
+                    cfg_coref = st.session_state["config_coref"]
+                    cooc_mode_val, cooc_tok, cooc_warn = resolve_cooc_backend(cfg_coref)
+                    if cooc_warn and st.session_state.get("sidebar_enable_cooc"):
+                        st.warning(cooc_warn)
+
+                    pdfs = sorted(target_pdf_dir.rglob("*.pdf"))
+                    if not pdfs:
+                        ingest_status_placeholder.warning("No PDFs found in that folder.")
+                    else:
+                        progress = st.progress(0.0, text="Starting ingestion…")
+                        done = errs = skipped = 0
+                        total = len(pdfs)
+                        for i, path_item in enumerate(pdfs, start=1):
+                            this_uri = str(path_item)
+                            this_doc_id = Path(path_item).stem
+                            progress.progress(i / total, text=f"[{i}/{total}] {this_doc_id}")
+                            try:
+                                res = run_ingestion_quick(
+                                    pdf_path=this_uri,
+                                    max_sentences=st.session_state["config_ingest"]["max_sentences"],
+                                    max_text_length=st.session_state["config_ingest"]["max_text_length"],
+                                    candidate_source=st.session_state["config_ui"].get("candidate_source", "span"),
+                                    coref_backend=cfg_coref.get("engine", "fastcoref"),
+                                    coref_device=_ensure_coref_device(cfg_coref),
+                                    resolve_text=cfg_coref.get("resolve_text", True),
+                                    coref_scope=cfg_coref.get("scope"),
+                                    coref_window_sentences=cfg_coref.get("window_sentences"),
+                                    coref_window_stride=cfg_coref.get("window_stride"),
+                                    coref_shortlist_mode=st.session_state.get("sidebar_coref_mode", "trie"),
+                                    coref_shortlist_topk=cfg_coref["coref_shortlist_topk"],
+                                    coref_trie_tau=cfg_coref["coref_trie_tau"],
+                                    coref_cooc_tau=cfg_coref["coref_cooc_tau"],
+                                    coref_use_pair_scorer=cfg_coref.get("coref_use_pair_scorer", False),
+                                    coref_scorer_threshold=cfg_coref.get("coref_scorer_threshold", 0.25),
+                                    coref_pair_scorer=cfg_coref.get("coref_pair_scorer"),
+                                    cooc_mode=cooc_mode_val,
+                                    cooc_hf_tokenizer=cooc_tok,
+                                )
+                                prod = res.get("production_output") or res
+
+                                export_production_to_flexiconc(
+                                    str(target_db),
+                                    this_doc_id,
+                                    prod,
+                                    uri=this_uri,
+                                    embedding_models=DEFAULT_EMBEDDING_MODELS,
+                                )
+
+                                chains = (prod.get("coreference_analysis") or {}).get("chains") or []
+                                if chains:
+                                    trie_root, trie_idf, chain_grams = build_ngram_trie(chains, char_n=4, token_ns=(2, 3))
+
+                                    cx2 = open_db(str(target_db))
+                                    try:
+                                        upsert_doc_trie(cx2, this_doc_id, trie_root, trie_idf, chain_grams)
+
+                                        if st.session_state.get("sidebar_enable_cooc") and _HAVE_COOCC_LOCAL:
+                                            full_text = prod.get("full_text") or ""
+                                            if full_text:
+                                                vocab, rows_c, norms = build_cooc_graph(
+                                                    full_text,
+                                                    window=5,
+                                                    min_count=2,
+                                                    topk_neighbors=10,
+                                                    mode=cooc_mode_val,
+                                                    hf_tokenizer=cooc_tok,
+                                                )
+                                                upsert_doc_cooc(cx2, this_doc_id, vocab, rows_c, norms)
+                                        cx2.commit()
+                                    finally:
+                                        cx2.close()
+                                    done += 1
+                                else:
+                                    skipped += 1
+                                    ingest_status_placeholder.info(f"No chains in analysis for {this_doc_id}; trie not written.")
+                            except Exception as e:
+                                errs += 1
+                                ingest_status_placeholder.exception(e)
+
+                        progress.progress(1.0, text="Finishing up…")
+                        try:
+                            cx3 = open_db(str(target_db))
+                            try:
+                                n_now = count_indices(cx3, "trie")
+                                summary = build_faiss_indices(cx3)
+                                ingest_status_placeholder.success(
+                                    f"Ingestion complete. Trie rows now: {n_now}. OK={done}, skipped={skipped}, errors={errs}."
+                                )
+                                if summary:
+                                    ingest_status_placeholder.caption(
+                                        ", ".join(
+                                            f"{k}: {v.get('count', 0)} vecs ({v.get('model')})"
+                                            for k, v in summary.items()
+                                        )
+                                    )
+                                try:
+                                    ingest_status_placeholder.caption(
+                                        f"Sample trie payload sizes: {list_index_sizes(cx3, 'trie', limit=3)}"
+                                    )
+                                except Exception:
+                                    pass
+                            finally:
+                                cx3.close()
+                        except Exception as e:
+                            ingest_status_placeholder.warning(
+                                f"Documents ingested but FAISS index build failed: {e}"
+                            )
+
+                        progress.empty()
+
+                        st.session_state["sidebar_pdf_dir_input"] = str(target_pdf_dir)
+        if ingest_submit:
+            pdf_dir_val = (st.session_state.get("sidebar_pdf_dir") or "").strip()
+            new_db_val = (st.session_state.get("sidebar_new_db_path") or "").strip()
+            enable_cooc_sidebar = bool(st.session_state.get("sidebar_enable_cooc", False) and _HAVE_COOCC_LOCAL)
+            coref_mode_sidebar = (st.session_state.get("sidebar_coref_mode") or "trie")
+
+            if not pdf_dir_val:
+                st.warning("Provide a PDF folder to ingest.")
+            else:
+                pdf_dir_path = Path(pdf_dir_val).expanduser()
+                if not pdf_dir_path.exists() or not pdf_dir_path.is_dir():
+                    st.error(f"PDF folder not found: {pdf_dir_path}")
+                else:
+                    current_db_path = Path(st.session_state.get("db_path") or cfg_corpus.get("sqlite_path", "")).expanduser()
+                    target_db_path = current_db_path
+                    if new_db_val:
+                        candidate = Path(new_db_val).expanduser()
+                        if not candidate.is_absolute():
+                            candidate = (current_db_path.parent / candidate).expanduser()
+                        target_db_path = candidate
+
+                    target_parent = target_db_path.parent
+                    try:
+                        target_parent.mkdir(parents=True, exist_ok=True)
+                    except Exception as exc:
+                        st.error(f"Unable to create parent folder {target_parent}: {exc}")
+                        target_db_path = None
+
+                    if target_db_path is not None:
+                        try:
+                            cx_test = open_db(str(target_db_path))
+                            cx_test.close()
+                        except Exception as exc:
+                            st.exception(exc)
+                            target_db_path = None
+
+                    if target_db_path is not None:
+                        target_db_path_str = str(target_db_path)
+                        if new_db_val:
+                            st.session_state["db_path"] = target_db_path_str
+                            cfg_corpus["sqlite_path"] = target_db_path_str
+                            st.session_state["sidebar_new_db_path"] = target_db_path_str
+
+                        pdfs = sorted(pdf_dir_path.rglob("*.pdf"))
+                        if not pdfs:
+                            st.warning("No PDFs found in that folder.")
+                        else:
+                            cfg_ing = st.session_state["config_ingest"]
+                            cfg_ui = st.session_state["config_ui"]
+                            cfg_coref = st.session_state["config_coref"]
+                            cooc_mode_val, cooc_tok, cooc_warn = resolve_cooc_backend(cfg_coref)
+
+                            log_container = st.container()
+                            progress = st.progress(0.0, text="Starting ingestion…")
+                            done = errs = 0
+                            total = len(pdfs)
+
+                            if enable_cooc_sidebar and cooc_warn:
+                                log_container.warning(f"{cooc_warn} Co-occurrence exports will use the spaCy backend.")
+
+                            for i, path_item in enumerate(pdfs, start=1):
+                                this_uri = str(path_item)
+                                this_doc_id = path_item.stem
+                                progress.progress(i / total, text=f"[{i}/{total}] {this_doc_id}")
+                                try:
+                                    res = run_ingestion_quick(
+                                        pdf_path=this_uri,
+                                        max_sentences=cfg_ing["max_sentences"],
+                                        max_text_length=cfg_ing["max_text_length"],
+                                        candidate_source=cfg_ui.get("candidate_source", "span"),
+                                        coref_backend=cfg_coref.get("engine", "fastcoref"),
+                                        coref_device=_ensure_coref_device(cfg_coref),
+                                        resolve_text=cfg_coref.get("resolve_text", True),
+                                        coref_scope=cfg_coref.get("scope"),
+                                        coref_window_sentences=cfg_coref.get("window_sentences"),
+                                        coref_window_stride=cfg_coref.get("window_stride"),
+                                        coref_shortlist_mode=coref_mode_sidebar,
+                                        coref_shortlist_topk=cfg_coref["coref_shortlist_topk"],
+                                        coref_trie_tau=cfg_coref["coref_trie_tau"],
+                                        coref_cooc_tau=cfg_coref["coref_cooc_tau"],
+                                        coref_use_pair_scorer=cfg_coref.get("coref_use_pair_scorer", False),
+                                        coref_scorer_threshold=cfg_coref.get("coref_scorer_threshold", 0.25),
+                                        coref_pair_scorer=cfg_coref.get("coref_pair_scorer"),
+                                        cooc_mode=cooc_mode_val,
+                                        cooc_hf_tokenizer=cooc_tok,
+                                    )
+                                    prod = res.get("production_output") or res
+
+                                    export_production_to_flexiconc(
+                                        target_db_path_str,
+                                        this_doc_id,
+                                        prod,
+                                        uri=this_uri,
+                                        embedding_models=DEFAULT_EMBEDDING_MODELS,
+                                    )
+
+                                    chains = (prod.get("coreference_analysis") or {}).get("chains") or []
+                                    if chains:
+                                        trie_root, trie_idf, chain_grams = build_ngram_trie(
+                                            chains, char_n=4, token_ns=(2, 3)
+                                        )
+
+                                        cx2 = open_db(target_db_path_str)
+                                        try:
+                                            upsert_doc_trie(cx2, this_doc_id, trie_root, trie_idf, chain_grams)
+
+                                            if enable_cooc_sidebar and _HAVE_COOCC_LOCAL:
+                                                full_text = prod.get("full_text") or ""
+                                                if full_text:
+                                                    vocab, rows_c, norms = build_cooc_graph(
+                                                        full_text,
+                                                        window=5,
+                                                        min_count=2,
+                                                        topk_neighbors=10,
+                                                        mode=cooc_mode_val,
+                                                        hf_tokenizer=cooc_tok,
+                                                    )
+                                                    upsert_doc_cooc(cx2, this_doc_id, vocab, rows_c, norms)
+                                            cx2.commit()
+                                        finally:
+                                            cx2.close()
+                                    done += 1
+                                    log_container.write(f"✅ {this_doc_id}")
+                                except Exception as exc:
+                                    errs += 1
+                                    log_container.error(f"❌ {this_doc_id}: {exc}")
+
+                            progress.progress(1.0, text="Ingestion complete")
+                            log_container.success(
+                                f"Ingestion complete. Processed {done} document(s) with {errs} error(s)."
+                            )
+
+                            try:
+                                cx_final = open_db(target_db_path_str)
+                                try:
+                                    summary = build_faiss_indices(cx_final)
+                                    cx_final.commit()
+                                finally:
+                                    cx_final.close()
+                                if summary:
+                                    kinds = ", ".join(sorted(summary.keys()))
+                                    log_container.info(
+                                        f"FAISS indices refreshed for {len(summary)} model(s): {kinds}."
+                                    )
+                                else:
+                                    log_container.info("No embeddings available for FAISS indices.")
+                            except Exception as exc:
+                                log_container.warning(f"FAISS index build skipped: {exc}")
     # Knobs — Ingestion
     with st.expander("Files / Corpus upload", expanded=False):
         cfg = st.session_state["config_ingest"]
@@ -1310,7 +1664,6 @@ with st.sidebar:
         cfg["debug"] = st.checkbox("Debug", value=cfg["debug"])
 
 # -------------------- Main: Steps 1 & 2 (full-width) --------------------
-# -------------------- Main: Steps 1 & 2 (full-width) --------------------
 with st.container(border=True):
     st.subheader("1) Files / Corpus")
     if doc_mode == "document":
@@ -1412,16 +1765,16 @@ with st.container(border=True):
                     with cA:
                         max_docs = st.number_input("Max docs (0 = all)", min_value=0, value=0, step=1)
                     with cB:
-                        enable_cooc = st.checkbox(
-                            "Also build co-occurrence", value=False and _HAVE_COOCC_LOCAL,
-                            help="Requires SciPy CSR; enable only if your environment supports it."
+                        enable_cooc = bool(
+                            st.session_state.get("sidebar_enable_cooc", False) and _HAVE_COOCC_LOCAL
+                        )
+                        st.caption(
+                            f"Co-occurrence export: {'enabled' if enable_cooc else 'disabled'} (set in sidebar)"
                         )
                     with cC:
-                        coref_mode = st.selectbox(
-                            "Coref shortlist mode",
-                            options=["trie", "both", "none"],
-                            index=0,
-                            help="Passed to run_ingestion_quick; 'trie' is sufficient for building the trie grams."
+                        coref_mode = st.session_state.get("sidebar_coref_mode", "trie")
+                        st.caption(
+                            f"Coref shortlist mode: {coref_mode} (configured in sidebar)"
                         )
 
                     cfg_coref = st.session_state["config_coref"]
@@ -1437,7 +1790,7 @@ with st.container(border=True):
                             rows = rows[: int(max_docs)]
 
                         if not rows:
-                            st.warning("No rows in documents table. Use 'Build / Rebuild corpus from folder' below.")
+                            st.warning("No rows in documents table. Use the sidebar ingestion controls to add documents.")
                         else:
                             total = len(rows)
                             prog = st.progress(0.0, text="Starting…")
@@ -1543,106 +1896,7 @@ with st.container(border=True):
                                     pass
                             finally:
                                 cx3.close()
-
-                    # ---- Build / Rebuild corpus from a PDF folder (full production) ----
-                    pdf_dir = st.text_input("PDF folder (for full corpus build)", value=source_root)
-                    if st.button("Build / Rebuild corpus from folder") and pdf_dir:
-                        from pathlib import Path as _Path
-                        pdfs = list(_Path(pdf_dir).rglob("*.pdf"))
-                        if not pdfs:
-                            st.warning("No PDFs found in that folder.")
-                        else:
-                            total = len(pdfs)
-                            prog = st.progress(0.0, text="Starting…")
-                            done = errs = 0
-                            for i, path_item in enumerate(pdfs, start=1):
-                                this_uri = str(path_item)
-                                this_doc_id = _Path(path_item).stem
-                                prog.progress(i / total, text=f"[{i}/{total}] {this_doc_id}")
-                                try:
-                                    res = run_ingestion_quick(
-                                        pdf_path=this_uri,
-                                        max_sentences=st.session_state["config_ingest"]["max_sentences"],
-                                        max_text_length=st.session_state["config_ingest"]["max_text_length"],
-                                        candidate_source=st.session_state["config_ui"].get("candidate_source", "span"),
-                                        coref_backend=cfg_coref.get("engine", "fastcoref"),
-                                        coref_device = _ensure_coref_device(cfg_coref),
-                                        resolve_text=cfg_coref.get("resolve_text", True),
-                                        coref_shortlist_mode=coref_mode,
-                                        coref_scope=cfg_coref.get("scope"),
-                                        coref_window_sentences=cfg_coref.get("window_sentences"),
-                                        coref_window_stride=cfg_coref.get("window_stride"),
-                                        
-                                        coref_shortlist_topk=cfg_coref["coref_shortlist_topk"],
-                                        coref_trie_tau=cfg_coref["coref_trie_tau"],
-                                        coref_cooc_tau=cfg_coref["coref_cooc_tau"],
-                                        coref_use_pair_scorer=cfg_coref.get("coref_use_pair_scorer", False),
-                                        coref_scorer_threshold=cfg_coref.get("coref_scorer_threshold", 0.25),
-                                        coref_pair_scorer=cfg_coref.get("coref_pair_scorer"),
-                                        cooc_mode=cooc_mode_val,
-                                        cooc_hf_tokenizer=cooc_tok,
-                                    )
-                                    prod = res.get("production_output") or res
-
-                                    # 1) One-off schema check / migration (open → print → close)
-                                    cx1 = open_db(db_path)
-                                    try:
-                                        st.write("documents cols:", [r2[1] for r2 in cx1.execute("PRAGMA table_info(documents)")])
-                                        st.write("embeddings cols:", [r2[1] for r2 in cx1.execute("PRAGMA table_info(embeddings)")])
-                                        st.write("indices cols:",    [r2[1] for r2 in cx1.execute("PRAGMA table_info(indices)")])
-                                    finally:
-                                        cx1.close()
-
-                                    # 2) Export the production
-                                    export_production_to_flexiconc(
-                                        db_path,
-                                        doc_id,
-                                        prod,
-                                        uri=uri,
-                                        embedding_models=DEFAULT_EMBEDDING_MODELS,
-                                    )
-                                        
-                                    # 3) Build & persist per-doc indices
-                                    chains = (prod.get("coreference_analysis") or {}).get("chains") or []
-                                    if chains:
-                                        trie_root, trie_idf, chain_grams = build_ngram_trie(chains, char_n=4, token_ns=(2, 3))
-
-                                        cx2 = open_db(db_path)
-                                        try:
-                                            upsert_doc_trie(cx2, this_doc_id, trie_root, trie_idf, chain_grams)
-
-                                            if enable_cooc and _HAVE_COOCC_LOCAL:
-                                                full_text = prod.get("full_text") or ""
-                                                if full_text:
-                                                    vocab, rows_c, norms = build_cooc_graph(
-                                                        full_text,
-                                                        window=5,
-                                                        min_count=2,
-                                                        topk_neighbors=10,
-                                                        mode=cooc_mode_val,
-                                                        hf_tokenizer=cooc_tok,
-                                                    )
-                                                    upsert_doc_cooc(cx2, this_doc_id, vocab, rows_c, norms)
-                                            cx2.commit()
-                                        finally:
-                                            cx2.close()
-                                        done += 1
-                                except Exception as e:
-                                    errs += 1
-                                    st.exception(e)
-
-                            # 4) Report current trie status
-                            cx3 = open_db(db_path)
-                            try:
-                                n_now = count_indices(cx3, "trie")
-                                st.success(f"Rebuild complete. Trie rows now: {n_now}. Built OK={done}, errors={errs}.")
-                                try:
-                                    st.caption(f"Sample payload sizes: {list_index_sizes(cx3, 'trie', limit=3)}")
-                                except Exception:
-                                    pass
-                            finally:
-                                cx3.close()
-
+                st.info("Use the sidebar controls to ingest folders into FlexiConc or start new databases.")
                 # ------ Load corpus rows (documents table preferred; legacy fallback) ------
                 try:
                     # Inspect documents schema
@@ -1821,18 +2075,19 @@ with st.container(border=True):
                 if prod and current_uri:
                     c3, c4 = st.columns([1, 1])
                     with c3:
-                        if st.button("💾 Save this analysis to corpus"):
+                        save_disabled = not bool(current_uri)
+                        if st.button("💾 Save this analysis to corpus", disabled=save_disabled):
                             try:
                                 from flexiconc_adapter import export_production_to_flexiconc
                                 doc_id_save = Path(current_uri).stem
                                 export_production_to_flexiconc(
                                     db_path,
-                                    doc_id,
+                                    doc_id_save,
                                     prod,
-                                    uri=uri,
+                                    uri=current_uri,
                                     embedding_models=DEFAULT_EMBEDDING_MODELS,
                                 )
-                                st.success("Saved into documents/sentences/chains.")
+                                st.success(f"Saved {doc_id_save} into documents/sentences/chains.")
                             except Exception as e:
                                 st.error(f"Save failed: {e}")
                     with c4:
@@ -2093,43 +2348,65 @@ with col4:
         if run_now or need_auto_run:
             prod = _get_production_output(st.session_state.get("results"))
             precomputed = None
-            embedding_provider = None
+            embedding_provider: Optional[Callable[[List[str]], Any]] = None
             if st.session_state["config_ui"]["mode"] == "corpus":
-               conc_res = st.session_state.get("corpus_concordance") or {}
-               conc_rows = conc_res.get("rows") or []
-               if conc_rows:
-                   rows = conc_rows
-                   precomputed = conc_res.get("embeddings")
-                   meta = conc_res.get("meta") or {}
-                   vector_backend = meta.get("vector_backend")
-                   db_path = st.session_state.get("db_path")
-                   if (
-                       precomputed is None
-                       and vector_backend
-                       and db_path
-                       and Path(str(db_path)).exists()
-                   ):
-                       def _embedding_provider(sentences, rows_snapshot=rows, backend=vector_backend, db_path=db_path):
-                           try:
-                               from flexiconc_adapter import open_db, get_sentence_embedding_cached
-                           except Exception as exc:
-                               raise RuntimeError(f"embedding fetch unavailable: {exc}") from exc
-                           conn = open_db(db_path)
-                           try:
-                               vectors = []
-                               for row_obj, sent in zip(rows_snapshot, sentences):
-                                   doc_id = row_obj.get("doc_id")
-                                   sid = row_obj.get("sentence_id")
-                                   if doc_id is None or sid is None:
-                                       raise ValueError("missing doc_id or sentence_id for embedding lookup")
-                                   vec = get_sentence_embedding_cached(conn, doc_id, sid, sent, model_name=backend)
-                                   if vec is None:
-                                       raise ValueError(f"no cached embedding for {doc_id}:{sid}")
-                                   vectors.append(vec)
-                               return vectors
-                           finally:
-                               conn.close()
-            if not prod:
+                conc_res = st.session_state.get("corpus_concordance") or {}
+                conc_rows = conc_res.get("rows") or []
+                if conc_rows:
+                    rows_snapshot = conc_rows
+                    precomputed = conc_res.get("embeddings")
+                    meta = conc_res.get("meta") or {}
+                    vector_backend = meta.get("vector_backend")
+                    db_path = st.session_state.get("db_path")
+                    if (
+                        precomputed is None
+                        and vector_backend
+                        and db_path
+                        and Path(str(db_path)).exists()
+                    ):
+                        def _embedding_provider(
+                            sentences: List[str],
+                            rows_snapshot: List[Dict[str, Any]] = rows_snapshot,
+                            backend: str = vector_backend,
+                            db_path: str = db_path,
+                        ) -> List[Any]:
+                            try:
+                                from flexiconc_adapter import (
+                                    open_db,
+                                    get_sentence_embedding_cached,
+                                )
+                            except Exception as exc:
+                                raise RuntimeError(
+                                    f"embedding fetch unavailable: {exc}"
+                                ) from exc
+
+                            conn = open_db(db_path)
+                            try:
+                                vectors = []
+                                for row_obj, sent in zip(rows_snapshot, sentences):
+                                    doc_id = row_obj.get("doc_id")
+                                    sid = row_obj.get("sentence_id")
+                                    if doc_id is None or sid is None:
+                                        raise ValueError(
+                                            "missing doc_id or sentence_id for embedding lookup"
+                                        )
+                                    vec = get_sentence_embedding_cached(
+                                        conn,
+                                        doc_id,
+                                        sid,
+                                        sent,
+                                        model_name=backend,
+                                    )
+                                    if vec is None:
+                                        raise ValueError(
+                                            f"no cached embedding for {doc_id}:{sid}"
+                                        )
+                                    vectors.append(vec)
+                                return vectors
+                            finally:
+                                conn.close()
+
+        embedding_provider = _embedding_providerif not prod:
                 warn_panel = {
                     "source": "doc_missing",
                     "doc_label": doc_label,
@@ -2230,7 +2507,92 @@ with st.container(border=True):
                 cA, cB = st.columns([1,1])
                 with cA:
                     if st.button(f"Send to SciCo panel: {doc_id}", key=f"gc_open_{i}"):
-                        # Reuse your corpus concordance pane by setting query_terms and letting it run
+                        try:
+                            from flexiconc_adapter import load_production_from_flexiconc
+                        except Exception as exc:
+                            st.error(f"Load failed: {exc}")
+                            continue
+
+                        if not db_path:
+                            st.error("No corpus database configured for SciCo hand-off.")
+                            continue
+
+                        try:
+                            prod_loaded = load_production_from_flexiconc(db_path, doc_id)
+                        except Exception as exc:
+                            st.error(f"Load failed: {exc}")
+                            continue
+
+                        if not prod_loaded:
+                            st.warning("No stored analysis for this doc.")
+                            continue
+
+                        precomputed = None
+                        embedding_provider: Optional[Callable[[List[str]], Any]] = None
+                        conc_cache = st.session_state.get("corpus_concordance") or {}
+                        rows_all = conc_cache.get("rows") or []
+                        if rows_all:
+                            filtered_rows = [
+                                row for row in rows_all if str(row.get("doc_id")) == str(doc_id)
+                            ]
+                            precomputed_all = conc_cache.get("embeddings")
+                            if precomputed_all is not None:
+                                precomputed = [
+                                    emb
+                                    for row, emb in zip(rows_all, precomputed_all)
+                                    if str(row.get("doc_id")) == str(doc_id)
+                                ]
+                            meta = conc_cache.get("meta") or {}
+                            vector_backend = meta.get("vector_backend")
+                            if (
+                                precomputed is None
+                                and filtered_rows
+                                and vector_backend
+                                and Path(str(db_path)).exists()
+                            ):
+                                def _embedding_provider(
+                                    sentences: List[str],
+                                    rows_snapshot: List[Dict[str, Any]] = filtered_rows,
+                                    backend: str = vector_backend,
+                                    db_path: str = db_path,
+                                ) -> List[Any]:
+                                    try:
+                                        from flexiconc_adapter import (
+                                            open_db,
+                                            get_sentence_embedding_cached,
+                                        )
+                                    except Exception as exc:
+                                        raise RuntimeError(
+                                            f"embedding fetch unavailable: {exc}"
+                                        ) from exc
+
+                                    conn = open_db(db_path)
+                                    try:
+                                        vectors = []
+                                        for row_obj, sent in zip(rows_snapshot, sentences):
+                                            row_doc = row_obj.get("doc_id")
+                                            sid = row_obj.get("sentence_id")
+                                            if row_doc is None or sid is None:
+                                                raise ValueError(
+                                                    "missing doc_id or sentence_id for embedding lookup"
+                                                )
+                                            vec = get_sentence_embedding_cached(
+                                                conn,
+                                                row_doc,
+                                                sid,
+                                                sent,
+                                                model_name=backend,
+                                            )
+                                            if vec is None:
+                                                raise ValueError(
+                                                    f"no cached embedding for {row_doc}:{sid}"
+                                                )
+                                            vectors.append(vec)
+                                        return vectors
+                                    finally:
+                                        conn.close()
+
+                                embedding_provider = _embedding_provider
                         panel = _prepare_scico_panel(
                                     prod_loaded,
                                     phrases,

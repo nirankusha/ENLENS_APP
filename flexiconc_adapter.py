@@ -127,6 +127,8 @@ def _ensure_schema(conn: sqlite3.Connection):
 
     conn.commit()
 
+
+
 def _migrate_documents_table(conn: sqlite3.Connection, *, force_rebuild: bool = False):
     cur = conn.cursor()
     
@@ -234,6 +236,96 @@ def _default_nlist(count: int) -> int:
     nlist = max(1, min(4096, nlist))
     return min(nlist, count)
 
+def query_concordance(
+    db_path: str,
+    terms: List[str],
+    mode: str = "AND",
+    limit: int = 500,
+    *,
+    vector_backend: Optional[str] = None,
+    use_faiss: bool = True,
+) -> Dict[str, Any]:
+    backend = _resolve_embedding_model_name(vector_backend)
+    clean_terms = [t.strip() for t in terms if t and str(t).strip()]
+    query_text = " ".join(clean_terms)
+    conn = open_db(db_path)
+    try:
+        if backend:
+            if use_faiss and query_text:
+                kind = _faiss_kind_for_model(backend)
+                try:
+                    persisted_hits = _query_faiss_index(
+                        conn,
+                        query_text=query_text,
+                        kind=kind,
+                        topk=int(limit),
+                    )
+                except KeyError:
+                    logger.info(
+                        "Persisted FAISS index '%s' not found; falling back to in-memory search",
+                        kind,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Persisted FAISS index '%s' failed; falling back to in-memory search: %s",
+                        kind,
+                        exc,
+                    )
+                else:
+                    if persisted_hits:
+                        logger.info(
+                            "Using persisted FAISS index '%s' for model '%s'",
+                            kind,
+                            backend,
+                        )
+                        rows: List[Dict[str, Any]] = []
+                        scores: List[float] = []
+                        for hit in persisted_hits:
+                            score_val = hit.get("score")
+                            score_float = float(score_val) if score_val is not None else None
+                            rows.append(
+                                {
+                                    "doc_id": hit.get("doc_id"),
+                                    "sentence_id": int(hit.get("sentence_id", 0)),
+                                    "text": hit.get("text", ""),
+                                    "start": hit.get("start"),
+                                    "end": hit.get("end"),
+                                    "path": hit.get("path", ""),
+                                    "score": score_float,
+                                    "rank": hit.get("rank"),
+                                }
+                            )
+                            if score_float is not None:
+                                scores.append(score_float)
+                        return {
+                            "rows": rows,
+                            "embeddings": None,
+                            "meta": {
+                                "mode": "vector",
+                                "vector_backend": backend,
+                                "faiss_used": True,
+                                "query_text": query_text,
+                                "total_candidates": len(persisted_hits),
+                                "scores": scores,
+                            },
+                            "terms": clean_terms,
+                        }
+                    else:
+                        logger.info(
+                            "Persisted FAISS index '%s' returned no hits; falling back to in-memory search",
+                            kind,
+                        )
+            try:
+                vec_res = _vector_concordance(conn, terms, int(limit), backend, use_faiss)
+            except Exception as exc:
+                logger.warning("Vector concordance failed; falling back to lexical: %s", exc)
+                vec_res = None
+            if vec_res:
+                return vec_res
+        return _lexical_concordance(conn, terms, mode, int(limit), backend)
+    finally:
+        conn.close()
+
 def build_faiss_indices(
     conn: sqlite3.Connection,
     *,
@@ -337,7 +429,7 @@ def _decode_faiss_payload(payload_blob: bytes) -> Tuple[Any, List[Tuple[str, int
             pass
     return index, ids, payload
 
-def query_concordance(
+def query_concordance__(
     conn: sqlite3.Connection,
     *,
     query_vector: Optional[np.ndarray] = None,
@@ -431,6 +523,97 @@ def query_concordance(
         )
 
     return results
+
+def _query_faiss_index(
+    conn: sqlite3.Connection,
+    *,
+    query_vector: Optional[np.ndarray] = None,
+    query_text: Optional[str] = None,
+    model: Optional[str] = None,
+    kind: Optional[str] = None,
+    aliases: Optional[Dict[str, str]] = None,
+    doc_id: str = GLOBAL_INDEX_DOC_ID,
+    topk: int = 10,
+) -> List[Dict[str, Any]]:
+    """Query a serialized FAISS index and return matching sentence rows."""
+
+    if faiss is None:
+        raise RuntimeError("faiss is not installed. Install faiss-cpu to query indices.")
+
+    if kind is None:
+        if not model:
+            raise ValueError("Either 'kind' or 'model' must be provided.")
+        kind = _faiss_kind_for_model(model, aliases)
+
+    if query_vector is None:
+        if query_text is None:
+            raise ValueError("Provide either a query vector or query text.")
+        if get_sentence_embedding is not None:
+            query_vector = np.asarray(get_sentence_embedding(query_text), dtype=np.float32)
+@@ -381,73 +381,77 @@ def query_concordance(
+    cur = conn.cursor()
+    row = cur.execute(
+        "SELECT payload FROM indices WHERE doc_id=? AND kind=?",
+        (doc_id, kind),
+    ).fetchone()
+    if not row:
+        raise KeyError(f"No FAISS index found for kind='{kind}'")
+
+    index, ids, payload = _decode_faiss_payload(row[0])
+    topk = max(1, int(topk))
+    scores, indices = index.search(query_vector, topk)
+    if scores.size == 0:
+        return []
+
+    hits: List[Tuple[str, int, float]] = []
+    for score, idx in zip(scores[0], indices[0]):
+        if idx < 0 or idx >= len(ids):
+            continue
+        doc_sent = ids[idx]
+        hits.append((doc_sent[0], int(doc_sent[1]), float(score)))
+
+    if not hits:
+        return []
+
+    results: List[Dict[str, Any]] = []
+    for doc_row, sent_id, score in hits:
+    for rank, (doc_row, sent_id, score) in enumerate(hits, start=1):
+        meta = cur.execute(
+            """
+            SELECT start, end, text, label, confidence, consensus
+            FROM sentences
+            WHERE doc_id=? AND sentence_id=?
+            SELECT s.start, s.end, s.text, s.label, s.confidence, s.consensus,
+                   COALESCE(d.uri, s.doc_id) AS uri
+            FROM sentences AS s
+            LEFT JOIN documents AS d ON d.doc_id = s.doc_id
+            WHERE s.doc_id=? AND s.sentence_id=?
+            """,
+            (doc_row, sent_id),
+        ).fetchone()
+        if not meta:
+            continue
+        start, end, text, label, confidence, consensus = meta
+        start, end, text, label, confidence, consensus, uri = meta
+        results.append(
+            {
+                "doc_id": doc_row,
+                "sentence_id": sent_id,
+                "score": score,
+                "start": start,
+                "end": end,
+                "text": text,
+                "label": label,
+                "confidence": confidence,
+                "consensus": consensus,
+                "path": uri or "",
+                "rank": rank,
+                "model": payload.get("model"),
+            }
+        )
+
+    return results
+
 
 def _resolve_embedding_model_name(name: Optional[str]) -> Optional[str]:
     if not name:
@@ -694,7 +877,7 @@ def _lexical_concordance(
     }
 
 
-def query_concordance(
+def query_concordance_(
     db_path: str,
     terms: List[str],
     mode: str = "AND",
