@@ -79,7 +79,7 @@ if mode == "Document analysis":
 
             if save_to_db and FLEXI_OK and export_production_to_flexiconc:
                 try:
-                    export_production_to_flexiconc(db_path, doc_id, out, uri=uploaded.name, write_embeddings=False)
+                    export_production_to_flexiconc(db_path, doc_id, out, uri=uploaded.name)
                     st.info(f"Saved to {db_path} with doc_id='{doc_id}'.")
                 except Exception as e:
                     st.warning(f"Save failed: {e}")
@@ -128,7 +128,7 @@ else:
                                 top_k=int(top_k),
                                 progress_callback=None
                             )
-                            export_production_to_flexiconc(db_path, pdf.stem, out, uri=str(pdf), write_embeddings=False)
+                            export_production_to_flexiconc(db_path, doc_id, out, uri=uploaded.name)
                         st.success(f"Indexed {len(pdfs)} documents into {db_path}")
                 except Exception as e:
                     st.error(f"Indexing failed: {e}")

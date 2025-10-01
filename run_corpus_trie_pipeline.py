@@ -7,70 +7,28 @@ import argparse, json, os, sys, re
 from pathlib import Path
 
 # Local modules
-from helper import extract_text_from_pdf_robust, preprocess_pdf_text
+from helper import (
+    extract_text_from_pdf_robust,
+    preprocess_pdf_text,
+    encode_mpnet,
+    encode_sdg_hidden,
+    encode_scico,
+)
 from helper_addons import build_sentence_index, build_ngram_trie
 from flexiconc_adapter import (
     open_db, 
-    export_production_to_flexiconc, 
-    upsert_doc_trie, 
     count_indices, 
     list_index_sizes
     )
 from global_coref_helper import global_coref_query
- 
-def build_repetition_chains(full_text: str, *, min_len=4, min_df=2, max_chains=50):
-    """
-    Very light coref surrogate for testing:
-      - find repeated tokens (length>=min_len) appearing >= min_df times
-      - each unique token -> one chain with all its occurrences
-    Mentions use absolute (start_char, end_char) in full_text.
-    """
-    # tokens to consider (letters/numbers/-/_), case-insensitive
-    words = re.findall(r"[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)?", full_text.lower())
-    freq = {}
-    for w in words:
-        if len(w) >= int(min_len):
-            freq[w] = freq.get(w, 0) + 1
-    # shortlist
-    cands = [w for w, c in sorted(freq.items(), key=lambda kv: (-kv[1], kv[0])) if c >= int(min_df)]
-    chains = []
-    for cid, w in enumerate(cands[:max_chains]):
-        # find all case-insensitive whole-word occurrences with char offsets
-        ments = []
-        for m in re.finditer(rf"(?i)\b{re.escape(w)}\b", full_text):
-            s, e = m.span()
-            ments.append({"start_char": s, "end_char": e, "text": full_text[s:e]})
-        if len(ments) >= 2:
-            chains.append({"chain_id": cid, "representative": w, "mentions": ments})
-    return chains
+from bridge_runners import run_ingestion_quick
 
-def make_minimal_production_output(full_text: str):
-    """
-    Construct a minimal production_output:
-      - full_text
-      - sentence_analyses: (sentence_id, sentence_text, doc_start, doc_end)
-      - coreference_analysis.chains: from repeated-token heuristic
-    """
-    sid2span, _tree = build_sentence_index(full_text)
-    sents = []
-    for sid in sorted(sid2span.keys()):
-        st, en = sid2span[sid]
-        sents.append({
-            "sentence_id": int(sid),
-            "sentence_text": full_text[st:en],
-            "doc_start": int(st),
-            "doc_end": int(en),
-            "classification": {},
-            "token_analysis": {},
-            "span_analysis": []
-        })
-    chains = build_repetition_chains(full_text)
-    return {
-        "full_text": full_text,
-        "sentence_analyses": sents,
-        "coreference_analysis": {"chains": chains},
-        "clusters": []
-    }
+EMBEDDING_MODELS = {
+    "mpnet": encode_mpnet,
+    "sdg-bert": encode_sdg_hidden,
+    "scico": encode_scico,
+}
+ 
 
 def iter_pdfs(pdf_dir: Path, limit: int | None):
     files = []
@@ -81,7 +39,12 @@ def iter_pdfs(pdf_dir: Path, limit: int | None):
     return files
 
 def main():
-    ap = argparse.ArgumentParser(description="PDF dir -> SQLite (FlexiConc-style + global trie) -> query")
+    ap = argparse.ArgumentParser(
+        description=(
+            "PDF dir -> production pipeline (SpanBERT/KP) -> FlexiConc SQLite with trie/co-occ + query."
+            "\nRequires ENLENS_SpanBert_corefree_prod.py (and optional ENLENS_KP_BERT_corefree_prod.py)."
+        )
+    )
     ap.add_argument("--pdf-dir", required=True, help="Directory containing PDFs (recursively scanned)")
     ap.add_argument("--db-path", required=True, help="SQLite path to create (no preexisting DB required)")
     ap.add_argument("--out-json", help="(Optional) folder to save per-doc production_output.json")
@@ -89,6 +52,18 @@ def main():
     ap.add_argument("--query", nargs="*", help="One or more span texts to query globally")
     ap.add_argument("--tau", type=float, default=0.18, help="Trie score threshold (IDF-Jaccard)")
     ap.add_argument("--topk", type=int, default=10, help="Max results to show")
+    ap.add_argument("--candidate-source", choices=["span", "kp"], default="span",
+                    help="Which production pipeline to run (span=SpanBERT coref, kp=KPE coref)")
+    ap.add_argument("--coref-device", default="auto",
+                    help="Device for coreference backend (mirrors app config; e.g., 'cpu', 'cuda:0', 'auto')")
+    ap.add_argument("--coref-shortlist-mode", choices=["off", "trie", "cooc", "both"], default="trie",
+                    help="Shortlist strategy for coref candidate generation")
+    ap.add_argument("--coref-shortlist-topk", type=int, default=50,
+                    help="Top-K shortlist size for candidate generation")
+    ap.add_argument("--cooc-mode", choices=["spacy", "hf"], default="spacy",
+                    help="Co-occurrence builder (spaCy or Hugging Face tokenizer)")
+    ap.add_argument("--cooc-hf-tokenizer",
+                    help="Tokenizer name when --cooc-mode=hf (e.g., 'bert-base-uncased')")
     args = ap.parse_args()
 
     pdf_dir = Path(args.pdf_dir)
@@ -115,38 +90,44 @@ def main():
         print(f"\n[{i}/{len(pdfs)}] Processing: {pdf_path.name}")
 
         # Extract + preprocess
-        raw = extract_text_from_pdf_robust(pdf_path)
-        text = preprocess_pdf_text(raw, max_length=None)
+        ingest_result = run_ingestion_quick(
+            str(pdf_path),
+            candidate_source=args.candidate_source,
+            doc_id=doc_id,
+            flexiconc_db_path=args.db_path,
+            coref_device=args.coref_device,
+            coref_shortlist_mode=args.coref_shortlist_mode,
+            coref_shortlist_topk=args.coref_shortlist_topk,
+            cooc_mode=args.cooc_mode,
+            cooc_hf_tokenizer=args.cooc_hf_tokenizer,
+        )
 
+        if not ingest_result.get("ok"):
+            print(f"  ❌ Ingestion failed: {ingest_result.get('error')}")
+            continue
         # Minimal production output
-        po = make_minimal_production_output(text)
+        warnings = ingest_result.get("_warn") or []
+        for w in warnings:
+            print(f"  ⚠️  {w}")
+
+        po = (ingest_result.get("production_output") or {}).copy()
 
         # Optionally save JSON
-        if out_json_dir:
+        if out_json_dir and po:
             jpath = out_json_dir / f"{doc_id}.json"
             jpath.write_text(json.dumps(po, ensure_ascii=False), encoding="utf-8")
             print(f"  ⬇️  Saved {jpath.name}")
-
-        # Write structured rows (documents/sentences/chains)
-        export_production_to_flexiconc(args.db_path, doc_id, po, uri=str(pdf_path))
-
-        # Build trie and persist under indices(kind='trie')
-        chains = (po.get("coreference_analysis") or {}).get("chains") or []
-        if chains:
-            root, idf, chain_grams = build_ngram_trie(chains, char_n=4, token_ns=(2,3))
-            cx = open_db(args.db_path)
-            try:
-                upsert_doc_trie(cx, doc_id, root, idf, chain_grams)
-                n = count_indices(cx, "trie")
-                print(f"   indices(kind='trie'): {n} rows now")
-                if n <= 3:
-                    print("   sample:", list_index_sizes(cx, "trie", limit=3))
-            finally:
-                cx.close()
-            print(f"  ✅ Indexed trie: chains={len(chains)}")
-        else:
-            print("  ⚠️  No chains built; skipping trie for this doc.")
-
+            # Summarize trie row counts for visibility
+        
+        cx = open_db(args.db_path)
+        try:
+            n = count_indices(cx, "trie")
+            print(f"   indices(kind='trie'): {n} rows now")
+            if n <= 3:
+                print("   sample:", list_index_sizes(cx, "trie", limit=3))
+        finally:
+            cx.close()
+        print("  ✅ Ingestion complete via production pipeline")
     # 3) Queries (trie-only; co-occ optional later)
     if args.query:
         cx = open_db(args.db_path)

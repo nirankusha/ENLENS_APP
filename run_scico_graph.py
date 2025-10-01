@@ -215,7 +215,12 @@ def build_scico_from_file(
     rows = _rows_from_production_output(production_output)
     if len(rows) < 2:
         return nx.DiGraph(), {"pairs_scored": 0}
-
+    
+    cluster_analysis = production_output.get("cluster_analysis") if isinstance(production_output, dict) else None
+    if isinstance(cluster_analysis, dict):
+        precomputed_embeddings = cluster_analysis.get("embeddings")
+    else:
+        precomputed_embeddings = None
     # 2) Pipeline knobs
     coherence_opts = dict(
         faiss_topk=faiss_topk,
@@ -262,6 +267,7 @@ def build_scico_from_file(
             centroid_top_n=5,
             centroid_store_vector=False,
         ),
+        precomputed_embeddings=precomputed_embeddings,
     )
     return G, meta
 

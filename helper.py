@@ -18,7 +18,7 @@ import ipywidgets as widgets
 from nltk.tokenize import sent_tokenize
 from pathlib import Path
 from difflib import SequenceMatcher
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Iterable, Sequence
 from spacy.lang.en.stop_words import STOP_WORDS
 import networkx as nx
 
@@ -48,11 +48,78 @@ bert_model = BertForSequenceClassification.from_pretrained(
 )
 bert_model.to(device).eval()
 
+def encode_sdg_hidden(texts: Sequence[str] | Iterable[str] | str,
+                      *,
+                      batch_size: int = 16,
+                      max_length: int = 512) -> np.ndarray:
+    """Return CLS hidden states from the SDG-BERT classifier."""
+    arr_texts = _ensure_text_list(texts)
+    if not arr_texts:
+        hidden = int(getattr(bert_model.config, "hidden_size", 768))
+        return np.zeros((0, hidden), dtype=np.float32)
+    reps = []
+    for start in range(0, len(arr_texts), int(batch_size)):
+        batch = arr_texts[start:start + int(batch_size)]
+        enc = bert_tokenizer(
+            batch,
+            padding=True,
+            truncation=True,
+            max_length=int(max_length),
+            return_tensors="pt",
+        )
+        enc = {k: v.to(device) for k, v in enc.items()}
+        with torch.no_grad():
+            outputs = bert_model(**enc, output_hidden_states=True, return_dict=True)
+            cls = outputs.hidden_states[-1][:, 0, :]
+        reps.append(cls.detach().cpu().numpy())
+    if not reps:
+        hidden = int(getattr(bert_model.config, "hidden_size", 768))
+        return np.zeros((0, hidden), dtype=np.float32)
+    return np.concatenate(reps, axis=0).astype(np.float32)
+
 # Load MPNet similarity model
 SIM_CHECKPOINT = "sentence-transformers/paraphrase-mpnet-base-v2"
 sim_tokenizer = AutoTokenizer.from_pretrained(SIM_CHECKPOINT)
 sim_model = SentenceTransformer(SIM_CHECKPOINT)
 sim_model.to(device).eval()
+
+def _ensure_text_list(texts: Sequence[str] | Iterable[str] | str | None) -> List[str]:
+    if texts is None:
+        return []
+    if isinstance(texts, str):
+        return [texts]
+    try:
+        iterable = list(texts)
+    except TypeError:
+        return [str(texts)]
+    out: List[str] = []
+    for item in iterable:
+        out.append(item if isinstance(item, str) else str(item))
+    return out
+
+def encode_mpnet(texts: Sequence[str] | Iterable[str] | str,
+                 *,
+                 batch_size: int = 32,
+                 normalize: bool = False) -> np.ndarray:
+    """Encode sentences using the shared MPNet SentenceTransformer."""
+    arr_texts = _ensure_text_list(texts)
+    if not arr_texts:
+        dim = getattr(sim_model, "get_sentence_embedding_dimension", lambda: 768)()
+        return np.zeros((0, dim), dtype=np.float32)
+    embs = sim_model.encode(
+        arr_texts,
+        batch_size=int(batch_size),
+        convert_to_numpy=True,
+        normalize_embeddings=bool(normalize),
+        show_progress_bar=False,
+    )
+    return np.asarray(embs, dtype=np.float32)
+
+def encode_scico(texts: Sequence[str] | Iterable[str] | str,
+                 *,
+                 batch_size: int = 32) -> np.ndarray:
+    """SciCo sentence embeddings (MPNet with normalization)."""
+    return encode_mpnet(texts, batch_size=batch_size, normalize=True)
 
 FASTCOREF_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _fastcoref = FCoref(device=FASTCOREF_DEVICE)  # loads default English model

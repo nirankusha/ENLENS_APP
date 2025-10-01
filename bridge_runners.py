@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 # bridge_runners.py
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Callable
 import importlib
 import logging
 
 import inspect
+from helper import encode_mpnet, encode_sdg_hidden, encode_scico
 from helper_addons import NGramIndex
 try:
     from helper_addons import build_ngram_trie, build_cooc_graph
@@ -25,6 +26,11 @@ from flexiconc_adapter import (
     upsert_doc_trie,
 )
 
+DEFAULT_EMBEDDING_MODELS = {
+    "mpnet": encode_mpnet,
+    "sdg-bert": encode_sdg_hidden,
+    "scico": encode_scico,
+}
 
 logger = logging.getLogger(__name__)
 
@@ -240,7 +246,7 @@ def run_ingestion_quick(
             doc_id,
             prod,
             uri=pdf_path,
-            write_embeddings=False,
+            embedding_models=DEFAULT_EMBEDDING_MODELS,
         )
         if callable(build_ngram_trie) and callable(build_cooc_graph):
             cx = open_db(db_path)
@@ -316,7 +322,14 @@ def rows_from_production(production_output: Dict[str, Any] | None) -> List[Dict[
         ))
     return rows
 
-def build_scico(rows: List[Dict[str, Any]], selected_terms: List[str], scico_cfg: Dict[str, Any]):
+def build_scico(
+    rows: List[Dict[str, Any]],
+    selected_terms: List[str],
+    scico_cfg: Dict[str, Any],
+    *,
+    precomputed_embeddings: Any = None,
+    embedding_provider: Optional[Callable[[List[str]], Any]] = None,
+):
     """
     Wraps scico_graph_pipeline.build_graph_from_selection with the UI dict.
     """
@@ -363,10 +376,36 @@ def build_scico(rows: List[Dict[str, Any]], selected_terms: List[str], scico_cfg
             centroid_top_n=scico_cfg["centroid_top_n"],
             centroid_store_vector=scico_cfg["centroid_store_vector"],
         ),
+        precomputed_embeddings=precomputed_embeddings,
+        embedding_provider=embedding_provider,
     )
     return G, meta
 
-def build_concordance(sqlite_path: str, terms: List[str], and_mode=True):
+def build_concordance(
+    sqlite_path: str,
+    terms: List[str],
+    and_mode: bool = True,
+    *,
+    vector_backend: Optional[str] = None,
+    use_faiss: bool = True,
+    limit: int = 500,
+) -> Dict[str, Any]:
+    """Run concordance query with optional vector backend + FAISS fallback."""
+    normalized_terms = [t for t in terms if t and str(t).strip()]
+    fallback = {
+        "rows": [],
+        "embeddings": None,
+        "meta": {
+            "mode": "unavailable",
+            "vector_backend": vector_backend,
+            "faiss_used": False,
+            "query_text": "",
+            "total_candidates": 0,
+            "scores": [],
+        },
+        "terms": normalized_terms,
+    }
+
     """
     Uses flexiconc_adapter if available; otherwise returns [].
     """
@@ -374,10 +413,35 @@ def build_concordance(sqlite_path: str, terms: List[str], and_mode=True):
         mod = importlib.import_module("flexiconc_adapter")
         search = getattr(mod, "query_concordance", None)
         if search is None:
-            return []
-        return search(sqlite_path, terms, mode="AND" if and_mode else "OR", limit=500)
-    except Exception:
-        return []
+            return fallback
+        result = search(
+            sqlite_path,
+            normalized_terms,
+            mode="AND" if and_mode else "OR",
+            limit=int(limit),
+            vector_backend=vector_backend,
+            use_faiss=use_faiss,
+        )
+        if isinstance(result, dict):
+            return result
+        # Legacy adapters may still return a list.
+        return {
+            "rows": list(result or []),
+            "embeddings": None,
+            "meta": {
+                "mode": "legacy",
+                "vector_backend": vector_backend,
+                "faiss_used": False,
+                "query_text": " ".join(normalized_terms),
+                "total_candidates": len(result or []),
+                "scores": [],
+            },
+            "terms": normalized_terms,
+        }
+    except Exception as exc:
+        logger.warning("concordance query failed: %s", exc)
+        return fallback
+
 
 def pick_sentence_coref_groups(production_output: Dict[str, Any], sent_idx: int):
     sents = production_output.get("sentence_analyses") or []

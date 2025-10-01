@@ -14,9 +14,10 @@ SciCO graph builder with:
 
 from __future__ import annotations
 import re
-from typing import List, Dict, Any, Tuple, Optional
-from dataclasses import dataclass
-
+import logging
+from typing import List, Dict, Any, Tuple, Optional, Callable, Sequence
+from dataclasses import dataclass, field
+import hashlib
 import numpy as np
 import networkx as nx
 
@@ -59,8 +60,216 @@ except Exception:
     prepare_data_for_presum = None
     batch_data = None
 
+logger = logging.getLogger(__name__)
 
 # ----------------------------- SciCo utilities -----------------------------
+_DEFAULT_EMBED_MODEL = "sentence-transformers/paraphrase-mpnet-base-v2"
+
+def _hash_sentence(text: str) -> str:
+    if text is None:
+        text = ""
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def _hash_sdg_targets(targets: Dict[str, Any]) -> str:
+    if not targets:
+        return "none"
+    items = sorted((str(k), str(v)) for k, v in targets.items())
+    payload = "|".join(f"{k}:{v}" for k, v in items)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _coerce_embedding_vector(vec: Any) -> Optional[np.ndarray]:
+    if vec is None:
+        return None
+    if isinstance(vec, dict):
+        for key in ("embedding", "vector", "values", "data"):
+            if key in vec:
+                vec = vec[key]
+                break
+        else:
+            return None
+    try:
+        arr = np.asarray(vec, dtype=np.float32)
+    except Exception:
+        return None
+    if arr.ndim == 1:
+        return arr
+    if arr.ndim == 2 and arr.shape[0] == 1:
+        return arr[0]
+    return None
+
+
+def _maybe_int(value: Any) -> Any:
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    try:
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+    except Exception:
+        pass
+    return value
+
+
+def _organize_precomputed_embeddings(precomputed: Any, n_sentences: int) -> Dict[str, Dict[Any, np.ndarray]]:
+    info = {
+        "model": None,
+        "by_index": {},
+        "by_sentence_id": {},
+        "by_hash": {},
+    }
+    if precomputed is None:
+        return info
+    if isinstance(precomputed, dict):
+        model = precomputed.get("model") or precomputed.get("model_name") or precomputed.get("backend")
+        if isinstance(model, str):
+            info["model"] = model
+
+        direct_maps = {
+            "by_index": precomputed.get("by_index"),
+            "by_sentence_id": precomputed.get("by_sentence_id"),
+            "by_hash": precomputed.get("by_hash"),
+        }
+        for key, mapping in direct_maps.items():
+            if isinstance(mapping, dict):
+                target = info[key]
+                for k, vec in mapping.items():
+                    arr = _coerce_embedding_vector(vec)
+                    if arr is None:
+                        continue
+                    if key == "by_index":
+                        idx = _maybe_int(k)
+                        if isinstance(idx, int) and 0 <= idx < n_sentences:
+                            target[idx] = arr
+                    elif key == "by_sentence_id":
+                        target[_maybe_int(k)] = arr
+                    else:
+                        target[str(k)] = arr
+
+        # Support paired sentence_ids/vectors structure
+        sent_ids = precomputed.get("sentence_ids")
+        vectors = precomputed.get("vectors")
+        if isinstance(sent_ids, (list, tuple)) and isinstance(vectors, (list, tuple)):
+            for sid, vec in zip(sent_ids, vectors):
+                arr = _coerce_embedding_vector(vec)
+                if arr is not None:
+                    info["by_sentence_id"][_maybe_int(sid)] = arr
+
+        # Fallback: treat remaining keys as direct mappings
+        reserved = {"model", "model_name", "backend", "by_index", "by_sentence_id", "by_hash", "sentence_ids", "vectors"}
+        for key, value in precomputed.items():
+            if key in reserved:
+                continue
+            arr = _coerce_embedding_vector(value)
+            if arr is None:
+                continue
+            norm_key = _maybe_int(key)
+            if isinstance(norm_key, int):
+                if 0 <= norm_key < n_sentences:
+                    info["by_index"][norm_key] = arr
+                else:
+                    info["by_sentence_id"][norm_key] = arr
+            else:
+                info["by_hash"][str(key)] = arr
+    elif isinstance(precomputed, (list, tuple)):
+        for idx, vec in enumerate(precomputed):
+            if idx >= n_sentences:
+                break
+            arr = _coerce_embedding_vector(vec)
+            if arr is not None:
+                info["by_index"][idx] = arr
+    return info
+
+
+@dataclass
+class GraphFeatureCache:
+    embeddings: Dict[Tuple[str, str], np.ndarray] = field(default_factory=dict)
+    crossencoder: Dict[Tuple[str, str, str], Dict[str, Any]] = field(default_factory=dict)
+    fingerprint: Optional[str] = None
+
+    def invalidate(
+        self,
+        sentences: Optional[Sequence[str]] = None,
+        *,
+        embeddings: bool = True,
+        crossencoder: bool = True,
+    ) -> None:
+        if sentences is None:
+            if embeddings:
+                self.embeddings.clear()
+            if crossencoder:
+                self.crossencoder.clear()
+            return
+
+        hashes = {_hash_sentence(s) for s in sentences}
+        if embeddings:
+            for key in list(self.embeddings.keys()):
+                if key[1] in hashes:
+                    self.embeddings.pop(key, None)
+        if crossencoder:
+            for key in list(self.crossencoder.keys()):
+                if key[2] in hashes:
+                    self.crossencoder.pop(key, None)
+
+    def get_embedding(self, backend: str, sentence_hash: str) -> Optional[np.ndarray]:
+        return self.embeddings.get((backend, sentence_hash))
+
+    def set_embedding(self, backend: str, sentence_hash: str, vector: np.ndarray) -> None:
+        if vector is None:
+            return
+        self.embeddings[(backend, sentence_hash)] = np.asarray(vector, dtype=np.float32)
+
+    def get_crossencoder(self, model: str, sdg_hash: str, sentence_hash: str) -> Optional[Dict[str, Any]]:
+        cached = self.crossencoder.get((model, sdg_hash, sentence_hash))
+        if cached is None:
+            return None
+        return dict(cached)
+
+    def set_crossencoder(self, model: str, sdg_hash: str, sentence_hash: str, scores: Dict[str, Any]) -> None:
+        self.crossencoder[(model, sdg_hash, sentence_hash)] = dict(scores)
+
+
+_DEFAULT_FEATURE_CACHE = GraphFeatureCache()
+
+
+def get_default_feature_cache() -> GraphFeatureCache:
+    return _DEFAULT_FEATURE_CACHE
+
+
+def _select_embedding_backend(
+    embedder: Optional[SentenceTransformer],
+    scico_cfg: ScicoConfig,
+    preferred_model: Optional[str] = None,
+):
+    if embedder is not None:
+        name = getattr(embedder, "model_name", None) or getattr(embedder, "name", None)
+        backend = f"custom::{name or embedder.__class__.__name__}"
+
+        def encode(texts: List[str]) -> np.ndarray:
+            return np.asarray(embedder.encode(texts), dtype=np.float32)
+
+        return backend, encode
+
+    model_hint = preferred_model
+    try:
+        from helper import sim_model as _default_embedder
+
+        backend_name = getattr(_default_embedder, "model_name", None) or getattr(_default_embedder, "name", None)
+        backend = f"helper::{backend_name or _default_embedder.__class__.__name__}"
+
+        def encode(texts: List[str]) -> np.ndarray:
+            return np.asarray(_default_embedder.encode(texts), dtype=np.float32)
+
+        return backend, encode
+    except Exception:
+        pass
+
+    backend = model_hint or _DEFAULT_EMBED_MODEL
+
+    def encode(texts: List[str]) -> np.ndarray:
+        return embed_sentences(texts, embedder=None, device=scico_cfg.device)
+
+    return backend, encode
 
 SCICO_LABELS = {
     0: "not_related",
@@ -161,21 +370,44 @@ def cluster_torque(embeddings: np.ndarray):
 
 # ----------------------------- CrossEncoder features -----------------------------
 
-def crossencoder_topk(sentences: List[str],
-                      sdg_targets: Optional[Dict[str,str]] = None,
-                      top_k: int = 3,
-                      model_name: str = "cross-encoder/ms-marco-MiniLM-L6-v2") -> List[Dict[str, Any]]:
+def crossencoder_topk(
+    sentences: List[str],
+    sdg_targets: Optional[Dict[str, str]] = None,
+    top_k: int = 3,
+    model_name: str = "cross-encoder/ms-marco-MiniLM-L6-v2",
+    *,
+    cache: Optional[GraphFeatureCache] = None,
+    sentence_hashes: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
     if sdg_targets is None or HF_CrossEncoder is None:
         return [{} for _ in sentences]
+    
+    cache = cache or _DEFAULT_FEATURE_CACHE
+    hashes = sentence_hashes or [_hash_sentence(s) for s in sentences]
+    sdg_hash = _hash_sdg_targets(sdg_targets)
     goals = list(sdg_targets.keys())
-    encoder = HF_CrossEncoder(model_name)
-    feats = []
-    for s in sentences:
-        pairs = [(s, g) for g in goals]
-        sc    = encoder.predict(pairs)
-        top   = sorted(zip(goals, sc), key=lambda x: x[1], reverse=True)[:top_k]
-        feats.append({g: float(score) for g, score in top})
-    return feats
+    results: List[Optional[Dict[str, Any]]] = [None] * len(sentences)
+    missing: List[Tuple[int, str, str]] = []
+
+    for idx, (sent, h) in enumerate(zip(sentences, hashes)):
+        cached = cache.get_crossencoder(model_name, sdg_hash, h) if cache else None
+        if cached is not None:
+            results[idx] = cached
+            continue
+        missing.append((idx, sent, h))
+
+    if missing:
+        encoder = HF_CrossEncoder(model_name)
+        for idx, sent, h in missing:
+            pairs = [(sent, g) for g in goals]
+            sc = encoder.predict(pairs)
+            top = sorted(zip(goals, sc), key=lambda x: x[1], reverse=True)[:top_k]
+            payload = {g: float(score) for g, score in top}
+            results[idx] = payload
+            if cache:
+                cache.set_crossencoder(model_name, sdg_hash, h, payload)
+
+    return [res or {} for res in results]
 
 
 # ----------------------------- Community helpers -----------------------------
@@ -312,8 +544,12 @@ def build_graph_from_selection(
     summarize: bool = False,                     # master switch
     summarize_on: str = "community",             # "community" | "kmeans" | "torque"
     summary_methods: Optional[List[str]] = None, # any of ["centroid","xsum","presumm"]
-    summary_opts: Optional[Dict[str, Any]] = None
-):
+    summary_opts: Optional[Dict[str, Any]] = None,
+    summary_opts: Optional[Dict[str, Any]] = None,
+    precomputed_embeddings: Optional[Any] = None,
+    feature_cache: Optional[GraphFeatureCache] = None,
+    cache_control: Optional[Dict[str, Any]] = None,
+    ):
     """
     Build SciCO graph and (optionally) summarize clusters/communities.
 
@@ -325,16 +561,40 @@ def build_graph_from_selection(
         - for "xsum": {"num_sentences": 1}
         - for "presumm": {"presumm_model": ExtSummarizer, "presumm_tokenizer": BertTokenizer, "device": "cuda"}
         - for SDG re-rank: {"sdg_targets": {...}, "sdg_top_k": 3, "cross_encoder_model": "..."}
+      Caching / reuse:
+      precomputed_embeddings may supply vectors by index, sentence id or text hash.
+      feature_cache caches embeddings + cross-encoder scores across invocations.
+      cache_control supports {"invalidate": bool, "invalidate_sentences": [...], "fingerprint": "..."}.  
     """
     if scico_cfg is None:
         scico_cfg = ScicoConfig(prob_threshold=0.55)
     if summary_methods is None:
         summary_methods = []
     summary_opts = summary_opts or {}
+    
+    feature_cache = feature_cache or _DEFAULT_FEATURE_CACHE
+    cache_control = cache_control or {}
 
+    if cache_control.get("invalidate"):
+        feature_cache.invalidate(
+            embeddings=cache_control.get("invalidate_embeddings", True),
+            crossencoder=cache_control.get("invalidate_crossencoder", True),
+        )
+    if cache_control.get("invalidate_sentences"):
+        feature_cache.invalidate(
+            cache_control.get("invalidate_sentences"),
+            embeddings=cache_control.get("invalidate_embeddings", True),
+            crossencoder=cache_control.get("invalidate_crossencoder", True),
+        )
+    if "fingerprint" in cache_control:
+        fp = str(cache_control.get("fingerprint"))
+        if feature_cache.fingerprint is not None and feature_cache.fingerprint != fp:
+            feature_cache.invalidate()
+        feature_cache.fingerprint = fp
     # ---------- 1) Collect texts ----------
     sentences = [r["text"] for r in rows]
     n = len(sentences)
+    sentence_hashes = [_hash_sentence(s) for s in sentences]
 
     if n <= 1:
         G = nx.DiGraph()
@@ -346,21 +606,68 @@ def build_graph_from_selection(
         return G, meta
 
     # ---------- 2) Embeddings ----------
-    if embedder is None:
-        try:
-            from helper import sim_model as _default_embedder
-            embedder = _default_embedder
-            embs = np.asarray(embedder.encode(sentences), dtype="float32")
-        except Exception:
-            embs = embed_sentences(sentences, embedder=None, device=scico_cfg.device)
-    else:
-        embs = np.asarray(embedder.encode(sentences), dtype="float32")
+    precomp_info = _organize_precomputed_embeddings(precomputed_embeddings, n)
+    backend_id, encode_fn = _select_embedding_backend(embedder, scico_cfg, preferred_model=precomp_info.get("model"))
+
+    embeddings: List[Optional[np.ndarray]] = [None] * n
+    missing: List[Tuple[int, str]] = []
+
+    for idx, (row, text_hash) in enumerate(zip(rows, sentence_hashes)):
+        # Inline embedding on the row (e.g., threaded from pipeline)
+        row_emb = None
+        for key in ("embedding", "vector", "mpnet_embedding"):
+            if key in row and row[key] is not None:
+                row_emb = _coerce_embedding_vector(row[key])
+                if row_emb is not None:
+                    break
+
+        if row_emb is None:
+            # Check organized precomputed pools
+            row_emb = (
+                precomp_info["by_index"].get(idx)
+                or precomp_info["by_sentence_id"].get(_maybe_int(row.get("sid")))
+                or precomp_info["by_sentence_id"].get(_maybe_int(row.get("sentence_id")))
+                or precomp_info["by_hash"].get(text_hash)
+            )
+
+        if row_emb is not None:
+            embeddings[idx] = row_emb
+            feature_cache.set_embedding(backend_id, text_hash, row_emb)
+            continue
+
+        cached = feature_cache.get_embedding(backend_id, text_hash)
+        if cached is not None:
+            embeddings[idx] = cached
+            continue
+
+        missing.append((idx, text_hash))
+
+    if missing:
+        to_encode = [sentences[idx] for idx, _ in missing]
+        new_embs = encode_fn(to_encode)
+        new_arr = np.asarray(new_embs, dtype=np.float32)
+        if new_arr.ndim == 1:
+            new_arr = new_arr.reshape(1, -1)
+        for (idx, text_hash), vec in zip(missing, new_arr):
+            embeddings[idx] = vec
+            feature_cache.set_embedding(backend_id, text_hash, vec)
+
+    if any(e is None for e in embeddings):
+        raise RuntimeError("Failed to obtain embeddings for all sentences")
+
+    embs = np.vstack([np.asarray(e, dtype=np.float32) for e in embeddings])
 
     norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-8
     X = embs / norms  # normalized cosine/IP ready
 
     # ---------- 3) CrossEncoder features ----------
-    ce_feats = crossencoder_topk(sentences, sdg_targets=sdg_targets, top_k=3)
+    ce_feats = crossencoder_topk(
+        sentences,
+        sdg_targets=sdg_targets,
+        top_k=3,
+        cache=feature_cache,
+        sentence_hashes=sentence_hashes,
+    )
 
     # ---------- 4) Clustering (SELECTABLE) ----------
     kml = None

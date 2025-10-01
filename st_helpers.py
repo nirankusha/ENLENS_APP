@@ -424,7 +424,7 @@ def render_coref_panel(coref_groups, production_output, mode: str = "document"):
         if chain:
             edges = chain.get("edges") or []
             if edges:
-                counts = Counter(str(e.get("tag") or e.get("relation") or "OTHER") for e in edges)
+                
                 def _canon_tag(tag_val: Any) -> str:
                     tag_txt = str(tag_val).strip().upper() if tag_val is not None else ""
                     tag_txt = tag_txt.replace("-", "_")

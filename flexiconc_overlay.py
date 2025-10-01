@@ -5,6 +5,7 @@ from pathlib import Path
 from collections import defaultdict
 import ipywidgets as W
 from IPython.display import display, HTML
+from typing import List, Dict, Any
 
 # SciCo + clustering + communities + summaries
 from scico_graph_pipeline import build_graph_from_selection, ScicoConfig
@@ -159,6 +160,9 @@ def launch_inline_overlay_widget(
     dd_sid   = W.Dropdown(options=sid_options, value=default_sentence_id,
                           description="sentence_id:", layout=W.Layout(width="260px"))
     mode     = W.ToggleButtons(options=["AND","OR"], value="AND", description="Query:", layout=W.Layout(width="220px"))
+    use_vector = W.Checkbox(value=True, description="Vector search", layout=W.Layout(width="160px"))
+    vector_backend = W.Text(value="mpnet", description="Embedding:", layout=W.Layout(width="260px"))
+    use_faiss_query = W.Checkbox(value=True, description="Use FAISS", layout=W.Layout(width="140px"))
 
     # --- shortlist controls ---
     use_short = W.Checkbox(value=False, description="Use coherence shortlist")
@@ -337,19 +341,15 @@ def launch_inline_overlay_widget(
         return set.intersection(*sets) if mode_ == "AND" else set.union(*sets)
 
     # --- background SciCo runner ---
-    def run_scico_async(terms, ids):
-        if not terms or not ids:
-            out_scico.clear_output(); return
-
-        # Collect rows the graph builder expects
-        rows = []
-        for sid in ids:
-            rec = sent_records.get(sid)
-            if rec:
-                rows.append(dict(sid=sid, text=rec["text"], path=rec["path"], start=rec["start"], end=rec["end"]))
-        if not rows:
-            out_scico.clear_output(); return
-
+    current_rows: List[Dict[str, Any]] = []
+    current_embeddings = None
+    current_meta: Dict[str, Any] = {}
+      
+    
+    
+    def run_scico_async(terms, rows, embeddings):
+        if not terms or not rows:
+            out_scico.clear_output(); return    
         # Build argument dict for pipeline (forward all knobs; defaults come from UI here)
         params = dict(
             selected_terms=terms,
@@ -405,6 +405,9 @@ def launch_inline_overlay_widget(
                 centroid_store_vector=False,
             ),
         )
+        
+        if embeddings is not None:
+            params["precomputed_embeddings"] = embeddings
 
         # allow caller overrides through scico_params
         if scico_params:
@@ -464,34 +467,96 @@ def launch_inline_overlay_widget(
 
     # --- render concordance list + (optionally) kick SciCo ---
     def render_results():
+        nonlocal current_rows, current_embeddings, current_meta
         out_res.clear_output()
         terms = sorted(sel, key=str.lower)
-        ids = combined_sentence_ids(terms, mode.value)
+        
 
         html = []
-        html.append(f"<div style='margin:4px 0;color:#666;'>Matches: {len(ids)} sentence(s) | Mode: <b>{mode.value}</b> | Terms: {', '.join(terms) if terms else '—'}</div>")
-        if not ids:
+        
+        if not terms:
             html.append("<em>Select buttons in the sentence above to query.</em>")
         else:
-            shown = 0
-            for sid in list(ids)[:200]:
-                rec = sent_records.get(sid)
-                if not rec: continue
-                s = bold_all_terms(rec['text'], terms)
-                html.append(f"""<div style="margin:6px 0;">
-                    <code style="font-size:13px;">{s}</code>
-                    <div style="color:#666;font-size:12px;">{os.path.basename(rec['path'])} [{rec['start']}:{rec['end']}] (sid={sid})</div>
-                </div>""")
-                shown += 1
-            if len(ids) > shown:
-                html.append(f"<div style='color:#666;font-size:12px;'>…and {len(ids)-shown} more not shown.</div>")
+            vector_mode = bool(use_vector.value and vector_backend.value.strip())
+            if vector_mode:
+                try:
+                    from flexiconc_adapter import query_concordance
+
+                    res = query_concordance(
+                        db_path,
+                        terms,
+                        mode=mode.value,
+                        limit=200,
+                        vector_backend=vector_backend.value.strip(),
+                        use_faiss=bool(use_faiss_query.value),
+                    )
+                    current_rows = res.get("rows") or []
+                    current_embeddings = res.get("embeddings")
+                    current_meta = res.get("meta") or {}
+                    html.append(
+                        f"<div style='margin:4px 0;color:#666;'>Vector matches: {len(current_rows)} | Backend: "
+                        f"{current_meta.get('vector_backend','?')} | Mode: <b>{current_meta.get('mode','vector')}</b></div>"
+                    )
+                    for row in current_rows[:200]:
+                        txt = row.get("text", "")
+                        score = row.get("score")
+                        score_str = f"{score:.3f}" if isinstance(score, (int, float)) else ""
+                        html.append(
+                            f"<div style='margin:6px 0;'>"
+                            f"<code style=\"font-size:13px;\">{bold_all_terms(txt, terms)}</code>"
+                            f"<div style='color:#666;font-size:12px;'>"
+                            f"{os.path.basename(row.get('path',''))}"
+                            f" [{row.get('start','?')}:{row.get('end','?')}]"
+                            f" (doc={row.get('doc_id','?')} sid={row.get('sentence_id','?')} score={score_str})"
+                            f"</div></div>"
+                        )
+                except Exception as exc:
+                    html.append(f"<div style='color:#b00;'>Vector search failed: {exc}</div>")
+                    vector_mode = False
+
+            if not current_rows:
+                ids = combined_sentence_ids(terms, mode.value)
+                html.append(
+                    f"<div style='margin:4px 0;color:#666;'>Matches: {len(ids)} sentence(s) | Mode: <b>{mode.value}</b>"
+                    f" | Terms: {', '.join(terms)}</div>"
+                )
+                if not ids:
+                    html.append("<em>No lexical matches.</em>")
+                else:
+                    shown = 0
+                    rows_local = []
+                    for sid in list(ids)[:200]:
+                        rec = sent_records.get(sid)
+                        if not rec:
+                            continue
+                        rows_local.append(dict(
+                            text=rec["text"],
+                            path=rec["path"],
+                            start=rec["start"],
+                            end=rec["end"],
+                            doc_id=os.path.basename(rec["path"]),
+                            sentence_id=sid,
+                        ))
+                        s = bold_all_terms(rec['text'], terms)
+                        html.append(
+                            f"<div style='margin:6px 0;'><code style=\"font-size:13px;\">{s}</code>"
+                            f"<div style='color:#666;font-size:12px;'>"
+                            f"{os.path.basename(rec['path'])} [{rec['start']}:{rec['end']}] (sid={sid})"
+                            f"</div></div>"
+                        )
+                        shown += 1
+                    if len(ids) > shown:
+                        html.append(f"<div style='color:#666;font-size:12px;'>…and {len(ids)-shown} more not shown.</div>")
+                    current_rows = rows_local
         with out_res:
             display(HTML("".join(html)))
 
         if scico_mode == "auto":
             run_scico_async(terms, ids)
+            run_scico_async(terms, current_rows, current_embeddings)
 
         btn_scico.disabled = not bool(terms and ids)
+        btn_scico.disabled = not bool(terms and current_rows)
 
     # --- UI building helpers ---
     def build_sentence_row(sid):
@@ -540,6 +605,9 @@ def launch_inline_overlay_widget(
 
     dd_sid.observe(on_sid_change, names="value")
     mode.observe(on_mode_change, names="value")
+    use_vector.observe(lambda change: render_results() if change["name"] == "value" else None, names="value")
+    use_faiss_query.observe(lambda change: render_results() if change["name"] == "value" else None, names="value")
+    vector_backend.observe(lambda change: render_results() if change["name"] == "value" else None, names="value")
     btn_scico.on_click(on_scico_click)
 
     # initial render
@@ -580,9 +648,12 @@ def launch_inline_overlay_widget(
     header = [dd_sid, mode]
     if scico_mode == "manual":
         header.append(btn_scico)
+    
+    vector_row = W.HBox([use_vector, vector_backend, use_faiss_query])
 
     ui = W.VBox([
         W.HBox(header),
+        vector_row,
         W.HTML("<hr style='margin:6px 0;'>"),
         out_sent,
         W.HTML("<hr style='margin:6px 0;'>"),

@@ -5,9 +5,11 @@
 
 import re
 import os
+import time
+import html
 from pathlib import Path
 import streamlit as st
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Iterable
 
 try:
     import torch
@@ -30,7 +32,7 @@ from st_helpers import (
 from ui_common import render_sentence_overlay
 
 from bridge_runners import (
-    run_ingestion_quick, rows_from_production, build_scico,
+    run_ingestion_quick, build_scico,
     build_concordance, pick_sentence_coref_groups
 )
 from utils_upload import save_uploaded_pdf
@@ -83,7 +85,8 @@ def _init_state():
     ss.setdefault("current_doc_rows", None)  # cache for single-doc concordance
     ss.setdefault("source_root", "")         # for legacy relative paths
     ss.setdefault("last_uri", None)          # remember last analyzed file path for save/upsert
-        
+    ss.setdefault("corpus_concordance", None)    
+    
     ss.setdefault("auto_run_global_coref", False)
     ss.setdefault("global_coref_hits", [])
     ss.setdefault("global_coref_and_mode", "OR")
@@ -91,6 +94,7 @@ def _init_state():
     ss.setdefault("global_coref_topk", 50)
     ss.setdefault("filter_local_coref", False)
     ss.setdefault("local_chain_grams", None)
+    ss.setdefault("scico_panel_data", None)
 _init_state()
 
 def _available_coref_devices() -> List[str]:
@@ -197,6 +201,452 @@ def _bold_terms_html(s: str, terms: List[str]) -> str:
         pat = re.compile(rf"(?i)\b{re.escape(t)}\b")
         out = pat.sub(lambda m: f"<b>{m.group(0)}</b>", out)
     return out
+
+# ===== Resolved sentence helpers & SciCo tree prep ======
+
+def _current_doc_label() -> Optional[str]:
+    res = st.session_state.get("results")
+    if isinstance(res, dict):
+        for key in ("document_id", "doc_id", "document_uri", "uri"):
+            val = res.get(key)
+            if val:
+                return str(val)
+        prod = res.get("production_output") if "production_output" in res else res
+        if isinstance(prod, dict):
+            for key in ("document_id", "doc_id", "document_uri", "uri"):
+                val = prod.get(key)
+                if val:
+                    return str(val)
+    return None
+
+def _collect_sentence_ranges(sentences: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    ranges = []
+    for s in sentences or []:
+        sid = s.get("sentence_id")
+        ranges.append({
+            "sentence_id": int(sid) if sid is not None else None,
+            "start": s.get("doc_start"),
+            "end": s.get("doc_end"),
+        })
+    return ranges
+
+def _assign_sentence_id(mention: Dict[str, Any], ranges: List[Dict[str, Any]]) -> Optional[int]:
+    sid = mention.get("sentence_id")
+    if sid is not None:
+        try:
+            return int(sid)
+        except Exception:
+            return None
+    s0, s1 = mention.get("start_char"), mention.get("end_char")
+    for r in ranges:
+        a, b = r.get("start"), r.get("end")
+        if None in (a, b, s0, s1):
+            continue
+        if int(a) <= int(s0) and int(s1) <= int(b):
+            return r.get("sentence_id")
+    return None
+
+def _resolve_sentence_texts(production_output: Dict[str, Any]) -> List[Dict[str, Any]]:
+    sentences = production_output.get("sentence_analyses") or []
+    chains = (production_output.get("coreference_analysis") or {}).get("chains") or []
+    ranges = _collect_sentence_ranges(sentences)
+
+    replacements: Dict[int, List[Dict[str, Any]]] = {}
+    for ch in chains:
+        rep = (ch.get("representative") or "").strip()
+        for mention in ch.get("mentions") or []:
+            sid = _assign_sentence_id(mention, ranges)
+            if sid is None:
+                continue
+            if not mention.get("is_pronoun", False):
+                continue
+            s0, s1 = mention.get("start_char"), mention.get("end_char")
+            if None in (s0, s1):
+                continue
+            replacements.setdefault(int(sid), []).append({
+                "start_char": int(s0),
+                "end_char": int(s1),
+                "replacement": rep,
+            })
+
+    resolved: List[Dict[str, Any]] = []
+    for sent in sentences:
+        text = sent.get("sentence_text") or ""
+        sid = sent.get("sentence_id")
+        try:
+            sid_int = int(sid) if sid is not None else None
+        except Exception:
+            sid_int = None
+        doc_start = sent.get("doc_start")
+        doc_end = sent.get("doc_end")
+        items = []
+        for repl in replacements.get(sid_int, []):
+            s0 = repl.get("start_char")
+            s1 = repl.get("end_char")
+            if None in (s0, s1, doc_start, doc_end):
+                continue
+            local_start = int(s0) - int(doc_start)
+            local_end = int(s1) - int(doc_start)
+            if local_start < 0 or local_end > len(text) or local_start >= local_end:
+                continue
+            items.append((local_start, local_end, repl.get("replacement") or ""))
+        items.sort(key=lambda it: it[0], reverse=True)
+        resolved_text = text
+        for s0, s1, rep in items:
+            rep = rep or ""
+            if s0 < 0 or s1 > len(resolved_text) or s0 >= s1:
+                continue
+            resolved_text = resolved_text[:s0] + rep + resolved_text[s1:]
+        resolved.append({
+            "sid": sid_int,
+            "resolved_text": resolved_text,
+            "original_text": text,
+            "doc_start": doc_start,
+            "doc_end": doc_end,
+        })
+    return resolved
+
+def _rows_from_resolved_sentences(resolved: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for item in resolved or []:
+        rows.append({
+            "sid": item.get("sid"),
+            "text": item.get("resolved_text") or "",
+            "path": "",
+            "start": item.get("doc_start"),
+            "end": item.get("doc_end"),
+        })
+    return rows
+
+def _safe_label(meta_val, idx: int) -> Optional[int]:
+    if meta_val is None:
+        return None
+    try:
+        if isinstance(meta_val, dict):
+            return None if meta_val.get(idx) is None else int(meta_val.get(idx))
+        if isinstance(meta_val, (list, tuple)):
+            return None if idx >= len(meta_val) else int(meta_val[idx])
+        return int(meta_val[idx])
+    except Exception:
+        return None
+
+def _build_chain_trees(
+    G,
+    meta: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+    production_output: Dict[str, Any],
+    resolved_sentences: List[Dict[str, Any]],
+    *,
+    include_chains: Optional[Iterable[int]] = None,
+) -> List[Dict[str, Any]]:
+    chains = (production_output.get("coreference_analysis") or {}).get("chains") or []
+    sid_to_idx: Dict[int, int] = {}
+    for idx, row in enumerate(rows):
+        sid = row.get("sid")
+        if sid is None:
+            continue
+        try:
+            sid_to_idx[int(sid)] = idx
+        except Exception:
+            continue
+
+    resolved_by_sid = {item.get("sid"): item for item in resolved_sentences}
+
+    chain_nodes: Dict[int, Dict[str, Any]] = {}
+    for ch in chains:
+        try:
+            cid = int(ch.get("chain_id"))
+        except Exception:
+            continue
+        node_indices: set[int] = set()
+        for mention in ch.get("mentions") or []:
+            sid = mention.get("sentence_id")
+            if sid is None:
+                continue
+            try:
+                idx = sid_to_idx.get(int(sid))
+            except Exception:
+                idx = None
+            if idx is not None:
+                node_indices.add(idx)
+        if not node_indices:
+            continue
+        chain_nodes[cid] = {
+            "indices": sorted(node_indices),
+            "representative": ch.get("representative") or "",
+        }
+
+    if include_chains is not None:
+        include_set = {int(c) for c in include_chains}
+        chain_nodes = {cid: data for cid, data in chain_nodes.items() if cid in include_set}
+
+    if not chain_nodes:
+        return []
+
+    parent_children: Dict[int, set[int]] = {}
+    incoming: Dict[int, set[int]] = {}
+    corefers: Dict[int, set[int]] = {}
+    for u, v, data in G.edges(data=True):
+        label = data.get("label")
+        if label == "corefer":
+            corefers.setdefault(int(u), set()).add(int(v))
+        elif label in {"parent", "child"}:
+            parent_children.setdefault(int(u), set()).add(int(v))
+            incoming.setdefault(int(v), set()).add(int(u))
+
+    trees: List[Dict[str, Any]] = []
+    for cid, info in sorted(chain_nodes.items(), key=lambda kv: kv[0]):
+        nodes_set = set(info["indices"])
+        if not nodes_set:
+            continue
+
+        children_map: Dict[int, List[int]] = {}
+        for parent, kids in parent_children.items():
+            if parent not in nodes_set:
+                continue
+            children = sorted(k for k in kids if k in nodes_set)
+            if children:
+                children_map[parent] = children
+
+        incoming_map: Dict[int, set[int]] = {}
+        for child in nodes_set:
+            parents = incoming.get(child, set())
+            incoming_map[child] = {p for p in parents if p in nodes_set}
+
+        roots = sorted(n for n in nodes_set if not incoming_map.get(n))
+        if not roots:
+            roots = sorted(nodes_set)
+
+        coref_map: Dict[int, List[int]] = {}
+        for node in nodes_set:
+            neigh = sorted(n for n in corefers.get(node, set()) if n in nodes_set and n != node)
+            if neigh:
+                coref_map[node] = neigh
+
+        nodes_payload: Dict[int, Dict[str, Any]] = {}
+        for node in nodes_set:
+            row = rows[node]
+            sid = row.get("sid")
+            resolved_info = resolved_by_sid.get(sid)
+            nodes_payload[node] = {
+                "sentence_idx": node,
+                "sentence_id": sid,
+                "resolved_text": (resolved_info or {}).get("resolved_text") or row.get("text") or "",
+                "original_text": (resolved_info or {}).get("original_text") or row.get("text") or "",
+                "doc_start": row.get("start"),
+                "doc_end": row.get("end"),
+                "community": _safe_label(meta.get("communities"), node),
+                "kmeans": _safe_label(meta.get("kmeans"), node),
+                "torque": _safe_label(meta.get("torque"), node),
+            }
+
+        trees.append({
+            "chain_id": cid,
+            "representative": info.get("representative") or "",
+            "roots": roots,
+            "children_map": children_map,
+            "coref_map": coref_map,
+            "nodes": nodes_payload,
+            "all_nodes": sorted(nodes_set),
+        })
+
+    return trees
+
+def _prepare_scico_panel(
+    production_output: Optional[Dict[str, Any]],
+    terms: List[str],
+    *,
+    source: str,
+    doc_label: Optional[str] = None,
+    include_chains: Optional[Iterable[int]] = None,
+    is_current_doc: bool = False,
+) -> Dict[str, Any]:
+    panel: Dict[str, Any] = {
+        "source": source,
+        "doc_label": doc_label,
+        "is_current_doc": is_current_doc,
+    }
+    terms_norm = [t.strip() for t in terms or [] if t and t.strip()]
+    panel["terms"] = terms_norm
+    panel["focus_chains"] = list(include_chains) if include_chains else None
+
+    if not production_output:
+        panel["error"] = "No production output available for SciCo."
+        return panel
+
+    resolved_sentences = _resolve_sentence_texts(production_output)
+    rows_resolved = _rows_from_resolved_sentences(resolved_sentences)
+    panel["resolved_sentences"] = resolved_sentences
+    panel["rows"] = rows_resolved
+
+    if not terms_norm:
+        panel["warning"] = "Commit phrases to trigger SciCo runs."
+        return panel
+    if not rows_resolved:
+        panel["error"] = "No sentences available for SciCo."
+        return panel
+
+    try:
+        G, meta = build_scico(
+            rows=rows_resolved,
+            selected_terms=terms_norm,
+            scico_cfg=st.session_state["config_scico"],
+        )
+    except Exception as exc:
+        panel["error"] = f"SciCo failed: {exc}"
+        return panel
+
+    panel["graph"] = G
+    panel["meta"] = meta
+    trees = _build_chain_trees(
+        G,
+        meta,
+        rows_resolved,
+        production_output,
+        resolved_sentences,
+        include_chains=include_chains,
+    )
+    panel["chains"] = trees
+    if not trees:
+        panel.setdefault("warning", "SciCo produced no chain-aligned sentences for the selected phrases.")
+    return panel
+
+def _render_sentence_entry(idx: int, chain: Dict[str, Any], panel: Dict[str, Any], level: int, relation: str):
+    node = chain["nodes"].get(idx)
+    if not node:
+        return
+
+    indent_px = max(0, int(level) * 18)
+    relation_map = {
+        "parent": "Parent",
+        "child": "Child",
+        "corefer": "Corefer",
+    }
+    relation_label = relation_map.get(relation, "Sentence")
+
+    sid = node.get("sentence_id")
+    sid_display = "—" if sid is None else sid
+    cluster_bits = []
+    if node.get("community") is not None:
+        cluster_bits.append(f"comm {node['community']}")
+    if node.get("kmeans") is not None:
+        cluster_bits.append(f"kmeans {node['kmeans']}")
+    if node.get("torque") is not None:
+        cluster_bits.append(f"torque {node['torque']}")
+    cluster_text = " · ".join(cluster_bits)
+
+    resolved_preview = html.escape(_preview_text(node.get("resolved_text"), 180))
+    original_preview = html.escape(_preview_text(node.get("original_text"), 180))
+    if resolved_preview != original_preview:
+        body_html = (
+            f"<div class='mono'>{resolved_preview}</div>"
+            f"<div style='font-size:11px;color:#7a7a7a'>orig: {original_preview}</div>"
+        )
+    else:
+        body_html = f"<div class='mono'>{resolved_preview}</div>"
+
+    header_html = f"{relation_label} · Sentence {sid_display}"
+    if cluster_text:
+        header_html += f" · {cluster_text}"
+
+    key_suffix = f"{panel.get('doc_label','doc')}_{chain['chain_id']}_{idx}_{relation}_{level}"
+    focus_target = sid if sid is not None else node.get("sentence_idx")
+
+    with st.container():
+        text_col, action_col = st.columns([12, 1])
+        with text_col:
+            st.markdown(
+                f"""
+                <div style='margin-left:{indent_px}px;border-left:1px solid #e0e0e0;padding-left:10px;margin-bottom:6px;'>
+                  <div style='font-size:12px;color:#555;'>{header_html}</div>
+                  <div style='font-size:13px;'>{body_html}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with action_col:
+            if st.button("Focus", key=f"focus_{key_suffix}"):
+                if focus_target is not None:
+                    st.session_state["selected_sentence_idx"] = int(focus_target)
+                st.session_state["last_action_ts"] = time.time()
+
+def _render_chain_node(idx: int, chain: Dict[str, Any], panel: Dict[str, Any], visited: set[int], level: int, relation: str):
+    if idx in visited:
+        return
+    visited.add(idx)
+    _render_sentence_entry(idx, chain, panel, level, relation)
+
+    for neighbor in chain.get("coref_map", {}).get(idx, []):
+        if neighbor in visited:
+            continue
+        _render_chain_node(neighbor, chain, panel, visited, level, "corefer")
+
+    for child in chain.get("children_map", {}).get(idx, []):
+        if child in visited:
+            continue
+        _render_chain_node(child, chain, panel, visited, level + 1, "child")
+
+def _render_chain_hierarchy(panel_data: Optional[Dict[str, Any]]):
+    st.markdown("#### SciCo · Chain hierarchy")
+    if not panel_data:
+        st.caption("Chain-centric trees appear after committing phrases or sending a global hit to the panel.")
+        return
+
+    if panel_data.get("doc_label") or panel_data.get("terms"):
+        bits = []
+        if panel_data.get("doc_label"):
+            bits.append(f"Doc: `{panel_data['doc_label']}`")
+        if panel_data.get("terms"):
+            bits.append("Terms: " + ", ".join(f"`{t}`" for t in panel_data["terms"]))
+        if panel_data.get("source"):
+            bits.append(f"Source: {panel_data['source']}")
+        st.caption(" · ".join(bits))
+
+    if panel_data.get("error"):
+        st.error(panel_data["error"])
+        return
+
+    if panel_data.get("warning"):
+        st.info(panel_data["warning"])
+
+    chains = panel_data.get("chains") or []
+    if not chains:
+        return
+
+    _ensure_highlight_css()
+
+    for chain in chains:
+        header = f"Chain {chain['chain_id']} · {len(chain['all_nodes'])} sentence(s)"
+        rep = chain.get("representative")
+        if rep:
+            header += f" · rep=“{_preview_text(rep, 60)}”"
+        with st.expander(header, expanded=False):
+            visited: set[int] = set()
+            for root in chain.get("roots") or []:
+                _render_chain_node(root, chain, panel_data, visited, level=0, relation="parent")
+            leftovers = [idx for idx in chain.get("all_nodes") if idx not in visited]
+            if leftovers:
+                st.caption("Unattached sentences")
+                for idx in leftovers:
+                    _render_chain_node(idx, chain, panel_data, visited, level=0, relation="corefer")
+
+def _handle_phrase_commit():
+    prod = _get_production_output(st.session_state.get("results"))
+    panel = _prepare_scico_panel(
+        prod,
+        st.session_state.get("query_terms", []),
+        source="doc_phrase_commit",
+        doc_label=_current_doc_label(),
+        include_chains=None,
+        is_current_doc=True,
+    )
+    st.session_state["scico_panel_data"] = panel
+    if panel.get("error"):
+        st.toast(panel["error"], icon="❌")
+    elif panel.get("warning"):
+        st.toast(panel["warning"], icon="ℹ️")
+    else:
+        st.toast("SciCo hierarchy updated for committed phrases.", icon="✅")
 
 # === Local coref helpers (doc-level) =========================================
 def _build_local_chain_grams(production_output):
@@ -670,7 +1120,20 @@ with st.sidebar:
             "Source folder (optional, e.g. /content/en)",
             value=st.session_state.get("source_root", "")
         )
-
+        cfg_corpus = st.session_state["config_corpus"]
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            cfg_corpus["vector_backend"] = st.text_input(
+                "Embedding backend (mpnet or ST model)",
+                value=cfg_corpus.get("vector_backend", "mpnet"),
+                help="Provide an alias like 'mpnet' or a sentence-transformers model id for concordance vector search.",
+            )
+        with c2:
+            cfg_corpus["use_faiss"] = st.checkbox(
+                "Use FAISS",
+                value=cfg_corpus.get("use_faiss", True),
+                help="Enable FAISS acceleration when a pre-built embedding index is available.",
+            )
     # Knobs — Ingestion
     with st.expander("Files / Corpus upload", expanded=False):
         cfg = st.session_state["config_ingest"]
@@ -1138,7 +1601,7 @@ with st.container(border=True):
                                         uri=uri,
                                         embedding_models=DEFAULT_EMBEDDING_MODELS,
                                     )
-
+                                        
                                     # 3) Build & persist per-doc indices
                                     chains = (prod.get("coreference_analysis") or {}).get("chains") or []
                                     if chains:
@@ -1362,7 +1825,13 @@ with st.container(border=True):
                             try:
                                 from flexiconc_adapter import export_production_to_flexiconc
                                 doc_id_save = Path(current_uri).stem
-                                export_production_to_flexiconc(db_path, doc_id_save, prod, uri=current_uri, write_embeddings=False)
+                                export_production_to_flexiconc(
+                                    db_path,
+                                    doc_id,
+                                    prod,
+                                    uri=uri,
+                                    embedding_models=DEFAULT_EMBEDDING_MODELS,
+                                )
                                 st.success("Saved into documents/sentences/chains.")
                             except Exception as e:
                                 st.error(f"Save failed: {e}")
@@ -1464,6 +1933,7 @@ with st.container(border=True):
         with c3:
             if st.button("Commit phrase ✅", type="primary"):
                 commit_current_phrase()
+                _handle_phrase_commit()
                 
         # --- local coref filter refresh
         prod_now = _get_production_output(st.session_state.get("results"))
@@ -1584,43 +2054,123 @@ with col3:
 with col4:
     with st.container(border=True):
         st.subheader("4) Concordance / Communities & Clusters")
-
+        
+        panel_data = st.session_state.get("scico_panel_data")
+        _render_chain_hierarchy(panel_data)
         # A) Concordance (corpus mode only, DB-backed)
         if st.session_state["config_ui"]["mode"] == "corpus":
             db_path = st.session_state["db_path"]
             if Path(db_path).exists() and st.session_state["query_terms"]:
                 with st.spinner("Querying concordance…"):
-                    conc = build_concordance(db_path, st.session_state["query_terms"], and_mode=True)
+                    cfg_corpus = st.session_state["config_corpus"]
+                    conc = build_concordance(
+                        db_path,
+                        st.session_state["query_terms"],
+                        and_mode=True,
+                        vector_backend=cfg_corpus.get("vector_backend"),
+                        use_faiss=cfg_corpus.get("use_faiss", True),
+                    )
+                st.session_state["corpus_concordance"] = conc
                 render_concordance_panel(conc)
+                
             else:
+                st.session_state["corpus_concordance"] = None
                 st.info("Add terms and make sure DB path is valid.")
 
         # B) SciCo (document & corpus; list only, no viz)
+        terms_now = st.session_state.get("query_terms", [])
+        terms_clean = [t.strip() for t in terms_now if t and t.strip()]
         run_now = st.button("Run SciCo (using selected terms)")
-        if (st.session_state["config_ui"]["auto_run_scico"] and st.session_state["query_terms"]) or run_now:
+        auto_requested = st.session_state["config_ui"].get("auto_run_scico") and bool(terms_clean)
+        doc_label = _current_doc_label()
+        need_auto_run = auto_requested and not (
+            panel_data
+            and panel_data.get("is_current_doc")
+            and panel_data.get("doc_label") == doc_label
+            and panel_data.get("terms") == terms_clean
+        )
+
+        if run_now or need_auto_run:
             prod = _get_production_output(st.session_state.get("results"))
-            rows = rows_from_production(prod)
-            if not rows:
-                st.warning("No rows to run SciCo on.")
+            precomputed = None
+            embedding_provider = None
+            if st.session_state["config_ui"]["mode"] == "corpus":
+               conc_res = st.session_state.get("corpus_concordance") or {}
+               conc_rows = conc_res.get("rows") or []
+               if conc_rows:
+                   rows = conc_rows
+                   precomputed = conc_res.get("embeddings")
+                   meta = conc_res.get("meta") or {}
+                   vector_backend = meta.get("vector_backend")
+                   db_path = st.session_state.get("db_path")
+                   if (
+                       precomputed is None
+                       and vector_backend
+                       and db_path
+                       and Path(str(db_path)).exists()
+                   ):
+                       def _embedding_provider(sentences, rows_snapshot=rows, backend=vector_backend, db_path=db_path):
+                           try:
+                               from flexiconc_adapter import open_db, get_sentence_embedding_cached
+                           except Exception as exc:
+                               raise RuntimeError(f"embedding fetch unavailable: {exc}") from exc
+                           conn = open_db(db_path)
+                           try:
+                               vectors = []
+                               for row_obj, sent in zip(rows_snapshot, sentences):
+                                   doc_id = row_obj.get("doc_id")
+                                   sid = row_obj.get("sentence_id")
+                                   if doc_id is None or sid is None:
+                                       raise ValueError("missing doc_id or sentence_id for embedding lookup")
+                                   vec = get_sentence_embedding_cached(conn, doc_id, sid, sent, model_name=backend)
+                                   if vec is None:
+                                       raise ValueError(f"no cached embedding for {doc_id}:{sid}")
+                                   vectors.append(vec)
+                               return vectors
+                           finally:
+                               conn.close()
+            if not prod:
+                warn_panel = {
+                    "source": "doc_missing",
+                    "doc_label": doc_label,
+                    "is_current_doc": True,
+                    "error": "No production output available for SciCo.",
+                    "terms": terms_clean,
+                }
+                st.session_state["scico_panel_data"] = warn_panel
+                panel_data = warn_panel
+                st.warning("No production output available for SciCo.")
             else:
+                label = "doc_auto" if (need_auto_run and not run_now) else "doc_manual"
                 with st.spinner("Running SciCo…"):
-                    G, meta = build_scico(
-                        rows=rows,
-                        selected_terms=st.session_state["query_terms"],
-                        scico_cfg=st.session_state["config_scico"],
+                    panel = _prepare_scico_panel(
+                        prod,
+                        terms_now,
+                        source=label,
+                        doc_label=doc_label,
+                        include_chains=None,
+                        is_current_doc=True,
+                        precomputed_embeddings=precomputed,
+                        embedding_provider=embedding_provider,
                     )
-                render_clusters_panel(
-                    G, meta,
-                    sentence_idx=st.session_state["selected_sentence_idx"],
-                    summarize_opts={
-                        "show_representative": True,
-                        "show_xsum": "xsum" in st.session_state["config_scico"]["summary_methods"],
-                        "show_presumm": "presumm" in st.session_state["config_scico"]["summary_methods"],
+                st.session_state["scico_panel_data"] = panel
+                panel_data = panel
+
+        panel_data = st.session_state.get("scico_panel_data")
+        if panel_data and panel_data.get("graph") and panel_data.get("meta") and panel_data.get("is_current_doc"):
+            render_clusters_panel(
+                panel_data["graph"],
+                panel_data["meta"],
+                sentence_idx=st.session_state["selected_sentence_idx"],
+                summarize_opts={
+                    "show_representative": True,
+                    "show_xsum": "xsum" in st.session_state["config_scico"]["summary_methods"],
+                    "show_presumm": "presumm" in st.session_state["config_scico"]["summary_methods"],
                     },
                 )
-        else:
+        elif not terms_clean:
             st.caption("SciCo: add terms and click the button (or enable auto-run).")
-
+        
         # C) Single-doc in-memory concordance (works for both doc mode and fresh corpus analysis)
         _render_single_doc_concordance()
 
@@ -1679,10 +2229,23 @@ with st.container(border=True):
 
                 cA, cB = st.columns([1,1])
                 with cA:
-                    if st.button(f"Open in Concordance: {doc_id}", key=f"gc_cc_{i}"):
+                    if st.button(f"Send to SciCo panel: {doc_id}", key=f"gc_open_{i}"):
                         # Reuse your corpus concordance pane by setting query_terms and letting it run
-                        st.session_state["query_terms"] = phrases
-                        st.toast("Switched query terms for concordance panel.")
+                        panel = _prepare_scico_panel(
+                                    prod_loaded,
+                                    phrases,
+                                    source="global_trie",
+                                    doc_label=f"{doc_id} · chain {chain_id}",
+                                    include_chains=[chain_id],
+                                    is_current_doc=False,
+                                )
+                                st.session_state["scico_panel_data"] = panel
+                                if panel.get("error"):
+                                    st.error(panel["error"])
+                                elif panel.get("warning"):
+                                    st.info(panel["warning"])
+                                else:
+                                    st.success(f"SciCo panel updated for {doc_id} (chain {chain_id}).")
                 with cB:
                     if st.button(f"Open doc analysis: {doc_id}", key=f"gc_open_{i}"):
                         try:

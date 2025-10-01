@@ -21,11 +21,14 @@ You can change/extend this schema if your existing FlexiConc has different names
 just adjust the mapping functions below.
 """
 from __future__ import annotations
-from typing import Any, Dict, List, Tuple, Optional, Iterable
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 import sqlite3, json, os, datetime
 import contextlib
 import gzip, io
+import gzip, io, base64, re, math, argparse
 import numpy as np
+import logging
+
 try:
     import scipy.sparse as sp
 except Exception:
@@ -37,6 +40,20 @@ try:
     from helper import get_sentence_embedding  # optional: (text) -> np.ndarray[float32]
 except Exception:
     get_sentence_embedding = None
+
+try:
+    import faiss
+except Exception:
+    faiss = None
+
+from ann_index import FaissIndex
+
+# Cache for lightweight SentenceTransformer loaders (avoid repeated init).
+_ST_MODELS: Dict[str, Any] = {}
+
+logger = logging.getLogger(__name__)
+
+GLOBAL_INDEX_DOC_ID = "__global__"
 
 def _ensure_schema(conn: sqlite3.Connection):
     cur = conn.cursor()
@@ -110,7 +127,7 @@ def _ensure_schema(conn: sqlite3.Connection):
 
     conn.commit()
 
-def _migrate_documents_table(conn: sqlite3.Connection):
+def _migrate_documents_table(conn: sqlite3.Connection, *, force_rebuild: bool = False):
     cur = conn.cursor()
     try:
         info = cur.execute("PRAGMA table_info(documents)").fetchall()
@@ -120,25 +137,56 @@ def _migrate_documents_table(conn: sqlite3.Connection):
     cols = {r[1] for r in info}
 
     doc_id_info = next((r for r in info if r[1] == "doc_id"), None)
+    declared_type = ""
+    is_integer_pk = False
     if doc_id_info:
         declared_type = (doc_id_info[2] or "").strip().upper()
         is_integer_pk = declared_type.startswith("INT") and bool(doc_id_info[5])
-        if is_integer_pk:
-            cur.execute("ALTER TABLE documents RENAME TO documents_old")
-            conn.commit()
+        
+        
+    needs_rebuild = bool(doc_id_info) and (force_rebuild or is_integer_pk)
 
-            _ensure_schema(conn)
+    if needs_rebuild:
+        cur.execute("DROP TABLE IF EXISTS documents_old")
+        conn.commit()
 
-            old_info = cur.execute("PRAGMA table_info(documents_old)").fetchall()
-            old_cols = {r[1] for r in old_info}
+        cur.execute("ALTER TABLE documents RENAME TO documents_old")
+        conn.commit()
 
-            insert_cols = ["doc_id", "uri", "created_at", "text_length", "full_text"]
-            select_exprs = [
-                "CAST(doc_id AS TEXT) AS doc_id",
-                "uri" if "uri" in old_cols else "NULL AS uri",
-                "created_at" if "created_at" in old_cols else "NULL AS created_at",
-            ]
-            
+        _ensure_schema(conn)
+
+        old_info = cur.execute("PRAGMA table_info(documents_old)").fetchall()
+        old_cols = {r[1] for r in old_info}
+
+        insert_cols = ["doc_id", "uri", "created_at", "text_length", "full_text"]
+        select_exprs = [
+            "CAST(doc_id AS TEXT) AS doc_id",
+            "uri" if "uri" in old_cols else "NULL AS uri",
+            "created_at" if "created_at" in old_cols else "NULL AS created_at",
+            (
+                "text_length"
+                if "text_length" in old_cols
+                else (
+                    "CASE WHEN full_text IS NOT NULL THEN LENGTH(full_text) END AS text_length"
+                    if "full_text" in old_cols
+                    else "NULL AS text_length"
+                )
+            ),
+            "full_text" if "full_text" in old_cols else "NULL AS full_text",
+        ]
+
+        cur.execute(
+            f"INSERT INTO documents ({', '.join(insert_cols)}) "
+            f"SELECT {', '.join(select_exprs)} FROM documents_old"
+        )
+        conn.commit()
+
+        cur.execute("DROP TABLE IF EXISTS documents_old")
+        conn.commit()
+
+        info = cur.execute("PRAGMA table_info(documents)").fetchall()
+        cols = {r[1] for r in info}
+        
     if "text_length" not in cols:
         cur.execute("ALTER TABLE documents ADD COLUMN text_length INTEGER")
     if "full_text" not in cols:
@@ -163,6 +211,505 @@ def _blob_from_npz(**arrays) -> bytes:
 def _npz_from_blob(b: bytes):
     buf = io.BytesIO(b)
     return np.load(buf, allow_pickle=False)
+
+def _faiss_kind_for_model(model: str, aliases: Optional[Dict[str, str]] = None) -> str:
+    if aliases and model in aliases:
+        return aliases[model]
+    base = model.split("/")[-1]
+    base = re.sub(r"[^0-9a-zA-Z]+", "_", base).strip("_") or "model"
+    return f"faiss_{base.lower()}"
+
+def _default_nlist(count: int) -> int:
+    if count <= 0:
+        return 0
+    # heuristic: sqrt-based, bounded for stability
+    nlist = int(round(math.sqrt(count)))
+    nlist = max(1, min(4096, nlist))
+    return min(nlist, count)
+
+def build_faiss_indices(
+    conn: sqlite3.Connection,
+    *,
+    models: Optional[Iterable[str]] = None,
+    aliases: Optional[Dict[str, str]] = None,
+    doc_id: str = GLOBAL_INDEX_DOC_ID,
+    nprobe: int = 16,
+) -> Dict[str, Dict[str, Any]]:
+    """Build FAISS ANN indices for sentence embeddings grouped by model.
+
+    Returns a mapping ``{kind: {"model": str, "count": int, "dim": int}}`` for
+    successfully persisted indices.
+    """
+
+    if faiss is None:
+        raise RuntimeError("faiss is not installed. Install faiss-cpu to build indices.")
+
+    _ensure_schema(conn)
+    cur = conn.cursor()
+
+    where_clause = ""
+    params: Tuple[Any, ...] = tuple()
+    if models:
+        model_list = list(models)
+        placeholders = ",".join("?" for _ in model_list)
+        where_clause = f" WHERE model IN ({placeholders})"
+        params = tuple(model_list)
+
+    rows = cur.execute(
+        "SELECT doc_id, sentence_id, model, dim, vector FROM embeddings" + where_clause,
+        params,
+    ).fetchall()
+
+    by_model: Dict[str, List[Tuple[str, int, np.ndarray]]] = {}
+    for doc_id_row, sentence_id, model_name, dim, blob in rows:
+        if blob is None:
+            continue
+        vec = np.frombuffer(blob, dtype=np.float32)
+        if dim and dim > 0 and vec.shape[0] != int(dim):
+            vec = vec[: int(dim)]
+        if vec.size == 0:
+            continue
+        vec = np.asarray(vec, dtype=np.float32)
+        by_model.setdefault(model_name, []).append((doc_id_row, int(sentence_id), vec))
+
+    summaries: Dict[str, Dict[str, Any]] = {}
+    for model_name, entries in by_model.items():
+        if not entries:
+            continue
+        target_dim = entries[0][2].shape[0]
+        filtered = [(doc, sid, vec) for doc, sid, vec in entries if vec.shape[0] == target_dim]
+        if not filtered:
+            continue
+        ids = [(doc, sid) for doc, sid, _ in filtered]
+        matrix = np.vstack([vec for _, _, vec in filtered]).astype(np.float32)
+        if matrix.ndim != 2:
+            matrix = matrix.reshape(matrix.shape[0], -1)
+        if matrix.shape[0] == 0 or matrix.shape[1] == 0:
+            continue
+        # Normalize rows for cosine similarity.
+        faiss.normalize_L2(matrix)
+
+        nlist = _default_nlist(matrix.shape[0])
+        if nlist <= 0:
+            continue
+        index = FaissIndex(matrix.shape[1], nlist=nlist, nprobe=nprobe)
+        index.add(matrix)
+
+        serialized = faiss.serialize_index(index.index)
+        payload = {
+            "model": model_name,
+            "ids": ids,
+            "count": len(ids),
+            "dim": int(matrix.shape[1]),
+            "nlist": int(index.nlist),
+            "nprobe": int(index.nprobe),
+            "index": base64.b64encode(serialized).decode("ascii"),
+        }
+
+        kind = _faiss_kind_for_model(model_name, aliases)
+        conn.execute(
+            "REPLACE INTO indices(doc_id, kind, payload) VALUES (?,?,?)",
+            (doc_id, kind, _blob_from_json(payload)),
+        )
+        summaries[kind] = {"model": model_name, "count": len(ids), "dim": int(matrix.shape[1])}
+
+    conn.commit()
+    return summaries
+
+def _decode_faiss_payload(payload_blob: bytes) -> Tuple[Any, List[Tuple[str, int]], Dict[str, Any]]:
+    payload = _json_from_blob(payload_blob)
+    if "index" not in payload:
+        raise ValueError("Index payload missing serialized bytes")
+    ids = [tuple(item) for item in payload.get("ids", [])]
+    serialized = base64.b64decode(payload["index"])
+    index = faiss.deserialize_index(serialized)
+    if "nprobe" in payload and hasattr(index, "nprobe"):
+        try:
+            index.nprobe = int(payload["nprobe"])
+        except Exception:
+            pass
+    return index, ids, payload
+
+def query_concordance(
+    conn: sqlite3.Connection,
+    *,
+    query_vector: Optional[np.ndarray] = None,
+    query_text: Optional[str] = None,
+    model: Optional[str] = None,
+    kind: Optional[str] = None,
+    aliases: Optional[Dict[str, str]] = None,
+    doc_id: str = GLOBAL_INDEX_DOC_ID,
+    topk: int = 10,
+) -> List[Dict[str, Any]]:
+    """Query a serialized FAISS index and return matching sentence rows."""
+
+    if faiss is None:
+        raise RuntimeError("faiss is not installed. Install faiss-cpu to query indices.")
+
+    if kind is None:
+        if not model:
+            raise ValueError("Either 'kind' or 'model' must be provided.")
+        kind = _faiss_kind_for_model(model, aliases)
+
+    if query_vector is None:
+        if query_text is None:
+            raise ValueError("Provide either a query vector or query text.")
+        if get_sentence_embedding is not None:
+            query_vector = np.asarray(get_sentence_embedding(query_text), dtype=np.float32)
+        else:
+            from helper import sim_model
+
+            query_vector = np.asarray(
+                sim_model.encode([query_text])[0], dtype=np.float32
+            )
+
+    if query_vector is None:
+        raise ValueError("Failed to obtain a query vector.")
+
+    query_vector = np.asarray(query_vector, dtype=np.float32)
+    if query_vector.ndim == 1:
+        query_vector = query_vector.reshape(1, -1)
+    faiss.normalize_L2(query_vector)
+
+    cur = conn.cursor()
+    row = cur.execute(
+        "SELECT payload FROM indices WHERE doc_id=? AND kind=?",
+        (doc_id, kind),
+    ).fetchone()
+    if not row:
+        raise KeyError(f"No FAISS index found for kind='{kind}'")
+
+    index, ids, payload = _decode_faiss_payload(row[0])
+    topk = max(1, int(topk))
+    scores, indices = index.search(query_vector, topk)
+    if scores.size == 0:
+        return []
+
+    hits: List[Tuple[str, int, float]] = []
+    for score, idx in zip(scores[0], indices[0]):
+        if idx < 0 or idx >= len(ids):
+            continue
+        doc_sent = ids[idx]
+        hits.append((doc_sent[0], int(doc_sent[1]), float(score)))
+
+    if not hits:
+        return []
+
+    results: List[Dict[str, Any]] = []
+    for doc_row, sent_id, score in hits:
+        meta = cur.execute(
+            """
+            SELECT start, end, text, label, confidence, consensus
+            FROM sentences
+            WHERE doc_id=? AND sentence_id=?
+            """,
+            (doc_row, sent_id),
+        ).fetchone()
+        if not meta:
+            continue
+        start, end, text, label, confidence, consensus = meta
+        results.append(
+            {
+                "doc_id": doc_row,
+                "sentence_id": sent_id,
+                "score": score,
+                "start": start,
+                "end": end,
+                "text": text,
+                "label": label,
+                "confidence": confidence,
+                "consensus": consensus,
+                "model": payload.get("model"),
+            }
+        )
+
+    return results
+
+def _resolve_embedding_model_name(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+    val = str(name).strip()
+    if not val:
+        return None
+    lower = val.lower()
+    mapping = {
+        "mpnet": "sentence-transformers/paraphrase-mpnet-base-v2",
+        "paraphrase-mpnet-base-v2": "sentence-transformers/paraphrase-mpnet-base-v2",
+        "sentence-transformers/paraphrase-mpnet-base-v2": "sentence-transformers/paraphrase-mpnet-base-v2",
+        "all-mpnet": "sentence-transformers/all-mpnet-base-v2",
+        "all-mpnet-base-v2": "sentence-transformers/all-mpnet-base-v2",
+        "sentence-transformers/all-mpnet-base-v2": "sentence-transformers/all-mpnet-base-v2",
+        "minilm": "sentence-transformers/all-MiniLM-L6-v2",
+        "all-minilm": "sentence-transformers/all-MiniLM-L6-v2",
+        "all-minilm-l6-v2": "sentence-transformers/all-MiniLM-L6-v2",
+        "sentence-transformers/all-minilm-l6-v2": "sentence-transformers/all-MiniLM-L6-v2",
+    }
+    return mapping.get(lower, val)
+
+
+def _get_sentence_transformer(model_name: str):
+    if not model_name:
+        return None
+    if model_name in _ST_MODELS:
+        return _ST_MODELS[model_name]
+    if model_name.endswith("paraphrase-mpnet-base-v2"):
+        try:
+            from helper import sim_model
+            _ST_MODELS[model_name] = sim_model
+            return sim_model
+        except Exception:
+            pass
+    try:
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer(model_name)
+        _ST_MODELS[model_name] = model
+        return model
+    except Exception as exc:
+        logger.warning("SentenceTransformer(%s) unavailable: %s", model_name, exc)
+        return None
+
+
+def _encode_query_vector(text: str, model_name: str) -> Optional[np.ndarray]:
+    model = _get_sentence_transformer(model_name)
+    if model is None:
+        return None
+    try:
+        vec = model.encode([text])[0]
+    except Exception as exc:
+        logger.warning("encode failed for model %s: %s", model_name, exc)
+        return None
+    try:
+        return np.asarray(vec, dtype="float32")
+    except Exception:
+        return None
+
+
+def _vector_concordance(
+    conn: sqlite3.Connection,
+    terms: List[str],
+    limit: int,
+    model_name: str,
+    use_faiss: bool,
+) -> Optional[Dict[str, Any]]:
+    clean_terms = [t.strip() for t in terms if t and str(t).strip()]
+    query_text = " ".join(clean_terms)
+    if not query_text:
+        return None
+
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT e.doc_id, e.sentence_id, e.vector, e.dim,
+                   s.text, s.start, s.end,
+                   COALESCE(d.uri, s.doc_id) AS uri
+            FROM embeddings e
+            JOIN sentences s ON s.doc_id=e.doc_id AND s.sentence_id=e.sentence_id
+            LEFT JOIN documents d ON d.doc_id=e.doc_id
+            WHERE e.model=?
+        """,
+            (model_name,),
+        )
+        records = cur.fetchall()
+    except Exception as exc:
+        logger.warning("Failed to read embeddings for %s: %s", model_name, exc)
+        return None
+
+    vectors: List[np.ndarray] = []
+    meta: List[Tuple[Any, Any, str, Any, Any, Any]] = []
+    for doc_id, sid, blob, dim, text, start, end, uri in records:
+        if blob is None or dim is None:
+            continue
+        try:
+            vec = np.frombuffer(blob, dtype="float32")
+        except Exception:
+            continue
+        if vec.size != int(dim):
+            continue
+        vectors.append(vec)
+        meta.append((doc_id, sid, text or "", start, end, uri))
+
+    if not vectors:
+        return None
+
+    X = np.vstack(vectors).astype("float32")
+    norms = np.linalg.norm(X, axis=1, keepdims=True) + 1e-8
+    Xn = X / norms
+
+    qvec = _encode_query_vector(query_text, model_name)
+    if qvec is None:
+        return None
+    qn = qvec / (np.linalg.norm(qvec) + 1e-8)
+
+    faiss_used = False
+    order: Optional[np.ndarray] = None
+    scores: Optional[np.ndarray] = None
+
+    if use_faiss and len(Xn) >= 8:
+        try:
+            from ann_index import FaissIndex
+
+            n_samples = Xn.shape[0]
+            nlist = max(1, min(256, int(np.sqrt(n_samples)) or 1))
+            nprobe = min(32, max(4, int(np.sqrt(nlist)) or 4))
+            index = FaissIndex(Xn.shape[1], nlist=nlist, nprobe=nprobe)
+            index.add(Xn)
+            D, I = index.search(qn.reshape(1, -1), topk=min(int(limit), n_samples))
+            order = I[0]
+            scores = D[0]
+            faiss_used = True
+        except Exception as exc:
+            logger.info("FAISS search unavailable; falling back to brute-force: %s", exc)
+            faiss_used = False
+
+    if order is None:
+        sims = Xn @ qn.reshape(-1, 1)
+        sims = sims.reshape(-1)
+        topk = min(int(limit), sims.shape[0])
+        order = np.argsort(sims)[::-1][:topk]
+        scores = sims[order]
+
+    rows: List[Dict[str, Any]] = []
+    emb_hits: List[np.ndarray] = []
+    score_list: List[float] = []
+    for rank, idx in enumerate(order):
+        doc_id, sid, text, start, end, uri = meta[int(idx)]
+        rows.append(
+            {
+                "doc_id": doc_id,
+                "sentence_id": int(sid),
+                "text": text,
+                "start": start,
+                "end": end,
+                "path": uri or "",
+                "score": float(scores[rank]) if scores is not None else None,
+                "rank": rank + 1,
+            }
+        )
+        emb_hits.append(X[int(idx)])
+        score_list.append(float(scores[rank]) if scores is not None else 0.0)
+
+    if not rows:
+        return None
+
+    return {
+        "rows": rows,
+        "embeddings": np.asarray(emb_hits, dtype="float32"),
+        "meta": {
+            "mode": "vector",
+            "vector_backend": model_name,
+            "faiss_used": faiss_used,
+            "query_text": query_text,
+            "total_candidates": len(meta),
+            "scores": score_list,
+        },
+        "terms": clean_terms,
+    }
+
+
+def _lexical_concordance(
+    conn: sqlite3.Connection,
+    terms: List[str],
+    mode: str,
+    limit: int,
+    model_name: Optional[str],
+) -> Dict[str, Any]:
+    clean_terms = [t.strip() for t in terms if t and str(t).strip()]
+    if not clean_terms:
+        return {
+            "rows": [],
+            "embeddings": None,
+            "meta": {
+                "mode": "lexical",
+                "vector_backend": model_name,
+                "faiss_used": False,
+                "query_text": "",
+                "total_candidates": 0,
+                "scores": [],
+            },
+            "terms": [],
+        }
+
+    clauses = []
+    params: List[Any] = []
+    for t in clean_terms:
+        clauses.append("LOWER(s.text) LIKE ?")
+        params.append(f"%{t.lower()}%")
+    joiner = " AND " if str(mode).upper() == "AND" else " OR "
+    sql = (
+        "SELECT s.doc_id, s.sentence_id, s.start, s.end, s.text, "
+        "COALESCE(d.uri, s.doc_id) AS uri "
+        "FROM sentences s "
+        "LEFT JOIN documents d ON d.doc_id = s.doc_id "
+        f"WHERE {joiner.join(clauses)} "
+        "ORDER BY s.doc_id, s.sentence_id "
+        "LIMIT ?"
+    )
+    params.append(int(limit))
+
+    cur = conn.cursor()
+    try:
+        rows_raw = cur.execute(sql, params).fetchall()
+    except Exception as exc:
+        logger.warning("Lexical concordance failed: %s", exc)
+        rows_raw = []
+
+    rows: List[Dict[str, Any]] = []
+    scores: List[float] = []
+    for doc_id, sid, start, end, text, uri in rows_raw:
+        txt = text or ""
+        score = sum(txt.lower().count(t.lower()) for t in clean_terms)
+        rows.append(
+            {
+                "doc_id": doc_id,
+                "sentence_id": int(sid),
+                "text": txt,
+                "start": start,
+                "end": end,
+                "path": uri or "",
+                "score": float(score),
+            }
+        )
+        scores.append(float(score))
+
+    return {
+        "rows": rows,
+        "embeddings": None,
+        "meta": {
+            "mode": "lexical",
+            "vector_backend": model_name,
+            "faiss_used": False,
+            "query_text": " ".join(clean_terms),
+            "total_candidates": len(rows_raw),
+            "scores": scores,
+        },
+        "terms": clean_terms,
+    }
+
+
+def query_concordance(
+    db_path: str,
+    terms: List[str],
+    mode: str = "AND",
+    limit: int = 500,
+    *,
+    vector_backend: Optional[str] = None,
+    use_faiss: bool = True,
+) -> Dict[str, Any]:
+    backend = _resolve_embedding_model_name(vector_backend)
+    conn = open_db(db_path)
+    try:
+        if backend:
+            try:
+                vec_res = _vector_concordance(conn, terms, int(limit), backend, use_faiss)
+            except Exception as exc:
+                logger.warning("Vector concordance failed; falling back to lexical: %s", exc)
+                vec_res = None
+            if vec_res:
+                return vec_res
+        return _lexical_concordance(conn, terms, mode, int(limit), backend)
+    finally:
+        conn.close()
 
 def open_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
@@ -189,17 +736,25 @@ def upsert_document(conn: sqlite3.Connection, doc_id: str, full_text: str | None
 
     text_len = len(full_text) if isinstance(full_text, str) else None
 
-    conn.execute(
-        """
+    
+    sql = """
         INSERT INTO documents(doc_id, uri, full_text, text_length)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(doc_id) DO UPDATE SET
           uri         = excluded.uri,
           full_text   = excluded.full_text,
           text_length = excluded.text_length
-        """,
-        (str(doc_id), uri, full_text, text_len)
-    )
+         """
+    params = (str(doc_id), uri, full_text, text_len)
+
+    try:
+        conn.execute(sql, params)
+    except sqlite3.IntegrityError as exc:
+        if "datatype mismatch" not in str(exc).lower():
+            raise
+        _migrate_documents_table(conn, force_rebuild=True)
+        conn.execute(sql, params)
+               
 
 def upsert_sentences(conn: sqlite3.Connection, doc_id: str, production_output: Dict[str, Any]):
     sents = production_output.get("sentence_analyses", []) or []
@@ -340,19 +895,89 @@ def _np_to_blob(vec) -> Optional[bytes]:
     except Exception:
         return None
 
-def upsert_sentence_embeddings(conn: sqlite3.Connection, doc_id: str,
-                               sentences: List[str],
-                               model_name: str = "helper.get_sentence_embedding"):
-    if get_sentence_embedding is None:
-        return  # no-op if you didn’t expose an embedder
+
+def _call_encode(encode_fn: Callable[[Sequence[str]], Any],
+                 sentences: Sequence[str]) -> List[Any]:
+    """Call *encode_fn* with best-effort batching, falling back per sentence."""
+    if not sentences:
+        return []
+    try:
+        vectors = encode_fn(sentences)
+    except TypeError:
+        vectors = None
+    except Exception as exc:  # propagate other errors to surface misconfiguration
+        raise
+    else:
+        coerced = _coerce_vectors(vectors, len(sentences))
+        if coerced is not None:
+            return coerced
+    # Fallback: try calling per sentence (handles encoders that expect str input)
+    out: List[Any] = []
+    for text in sentences:
+        try:
+            vec = encode_fn(text)  # type: ignore[arg-type]
+        except TypeError:
+            vec = encode_fn([text])  # type: ignore[arg-type]
+        out.append(vec)
+    return out
+
+
+def _coerce_vectors(vectors: Any, expected_len: int) -> Optional[List[Any]]:
+    if vectors is None:
+        return None
     import numpy as np
+
+    if isinstance(vectors, np.ndarray):
+        if vectors.ndim == 1:
+            if expected_len == 1:
+                return [vectors]
+            return None
+        if vectors.ndim == 2:
+            arr = [vectors[i] for i in range(min(expected_len, vectors.shape[0]))]
+            return arr
+    try:
+        seq = list(vectors)
+    except Exception:
+        return None
+    if len(seq) != expected_len:
+        # allow callers that yield generators or mismatched lengths to fallback later
+        return None
+    return seq
+
+
+def _resolve_encode_fn(encoder: Any) -> Optional[Callable[[Sequence[str]], Any]]:
+    if encoder is None:
+        return None
+    if callable(encoder):
+        return encoder
+    encode_attr = getattr(encoder, "encode", None)
+    if callable(encode_attr):
+        return encode_attr
+    return None
+
+
+def upsert_sentence_embeddings(conn: sqlite3.Connection,
+                               doc_id: str,
+                               sentences: Sequence[str],
+                               *,
+                               model_name: str,
+                               encode_fn: Callable[[Sequence[str]], Any] | None = None):
+    import numpy as np
+
+    if encode_fn is None:
+        encode_fn = _resolve_encode_fn(get_sentence_embedding) if get_sentence_embedding else None
+    if encode_fn is None:
+        return
+    vectors = _call_encode(encode_fn, list(sentences))
     rows = []
-    for sid, text in enumerate(sentences):
-        vec = get_sentence_embedding(text)  # expected np.ndarray[float32] shape (d,)
-        if vec is None: 
+    for sid, vec in enumerate(vectors):
+        if vec is None:
             continue
-        blob = _np_to_blob(vec)
-        rows.append((doc_id, sid, model_name, int(vec.shape[-1]), blob))
+        arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+        if arr.size == 0:
+            continue
+        blob = _np_to_blob(arr)
+        rows.append((doc_id, sid, model_name, int(arr.shape[-1]), blob))
     if rows:
         conn.executemany("""
             INSERT INTO embeddings(doc_id, sentence_id, model, dim, vector)
@@ -361,6 +986,7 @@ def upsert_sentence_embeddings(conn: sqlite3.Connection, doc_id: str,
                 dim=excluded.dim, vector=excluded.vector
         """, rows)
         conn.commit()
+
 
 def get_sentence_embedding_cached(conn, doc_id, sentence_id, text, model_name="paraphrase-mpnet-base-v2"):
     """
@@ -392,8 +1018,11 @@ def get_sentence_embedding_cached(conn, doc_id, sentence_id, text, model_name="p
     return emb
 
 
-def export_production_to_flexiconc(db_path: str, doc_id: str, production_output: Dict[str, Any],
-                                   uri: Optional[str] = None, write_embeddings: bool = False):
+def export_production_to_flexiconc(db_path: str,
+                                   doc_id: str,
+                                   production_output: Dict[str, Any],
+                                   uri: Optional[str] = None,
+                                   embedding_models: Optional[Dict[str, Any]] = None):
     conn = open_db(db_path)
     try:
         # 1) documents
@@ -439,9 +1068,17 @@ def export_production_to_flexiconc(db_path: str, doc_id: str, production_output:
         conn.commit()
 
         upsert_clusters(conn, doc_id, production_output)
-        if write_embeddings:
-            sentences = [sa.get("sentence_text","") for sa in production_output.get("sentence_analyses",[])]
-            upsert_sentence_embeddings(conn, doc_id, sentences)
+        if embedding_models:
+            sentences = [sa.get("sentence_text", "") for sa in production_output.get("sentence_analyses", [])]
+            for model_name, encoder in embedding_models.items():
+                encode_fn = _resolve_encode_fn(encoder)
+                try:
+                    upsert_sentence_embeddings(conn, doc_id, sentences, model_name=model_name, encode_fn=encode_fn)
+                except Exception:
+                    # Surface issues but continue with other backends
+                    import traceback
+
+                    traceback.print_exc()
     finally:
         conn.close()
 
@@ -552,6 +1189,60 @@ def load_production_from_flexiconc(db_path: str, doc_id: str) -> Dict[str, Any]:
 
     finally:
         conn.close()
+
+def _main_cli():
+    parser = argparse.ArgumentParser(description="FlexiConc maintenance utilities")
+    sub = parser.add_subparsers(dest="command")
+
+    rebuild = sub.add_parser("build-faiss", help="Rebuild FAISS ANN indices from embeddings")
+    rebuild.add_argument("db", help="Path to FlexiConc SQLite database")
+    rebuild.add_argument(
+        "--model",
+        dest="models",
+        action="append",
+        help="Restrict to one or more embedding model names",
+    )
+    rebuild.add_argument(
+        "--alias",
+        dest="aliases",
+        action="append",
+        default=None,
+        help="Alias mapping in the form model=faiss_kind",
+    )
+    rebuild.add_argument("--nprobe", type=int, default=16, help="FAISS nprobe value")
+
+    args = parser.parse_args()
+    if args.command == "build-faiss":
+        alias_map = {}
+        if args.aliases:
+            for pair in args.aliases:
+                if "=" not in pair:
+                    continue
+                model_name, alias = pair.split("=", 1)
+                alias_map[model_name] = alias
+        conn = open_db(args.db)
+        try:
+            summary = build_faiss_indices(
+                conn,
+                models=args.models,
+                aliases=(alias_map or None),
+                nprobe=int(args.nprobe),
+            )
+        finally:
+            conn.close()
+        if not summary:
+            print("No embeddings found to index.")
+        else:
+            for kind, meta in summary.items():
+                print(
+                    f"Stored {kind}: model={meta['model']} count={meta['count']} dim={meta['dim']}"
+                )
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    _main_cli()
 
 """
 Created on Sat Aug 16 19:08:03 2025
